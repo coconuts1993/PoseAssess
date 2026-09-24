@@ -1,0 +1,19 @@
+# PoseAssess - Wii Balance Board support (OPTIONAL)
+#
+# The only new dependency of the Wii Balance Board features (pages "2b. Wii Board" and
+# "3b. Capture", run_wii.bat / "python -m poseassess.wii") is hidapi, which talks to the
+# Bluetooth-paired board. Without it PoseAssess starts and works as before; the status bar shows
+# "Wii: off (hidapi not installed - pip install hidapi)", the simulator still works, and existing
+# Wii recordings can still be imported, aligned and analysed.
+#
+# Portable bundle, on the build PC (internet), from the bundle folder:
+#     venv\Scripts\python.exe -m pip install -r requirements-wii.txt
+# (or simply:  venv\Scripts\python.exe -m pip install hidapi)
+# The Windows wheel contains the HID DLL; nothing else has to be installed.
+# Offline PC: see README_DEPLOY.txt, "WII BALANCE BOARD (OPTIONAL)".
+#
+# Everything else the Wii features use is already in the bundle (see pip_freeze.txt):
+# numpy, opencv-python, PySide6, pyqtgraph + PyOpenGL (3D View overlays), matplotlib (plots),
+# scipy (signal filtering for the alignment; optional) and the Python 3.11 standard library.
+# Tested with hidapi 0.15.0 (Python 3.11).
+hidapi>=0.14

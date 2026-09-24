@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QCheckBox, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QPlainTextEdit,
+    QCheckBox, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QMessageBox, QPlainTextEdit,
     QPushButton, QVBoxLayout, QWidget,
 )
 
@@ -92,6 +92,11 @@ class RunPage(BasePage):
         stages = self._selected_stages()
         if not stages:
             return
+        export = self.state.busy("export")
+        if export:  # it replaces videos/ and Config.toml while the pipeline would read them
+            QMessageBox.warning(self, "Run pipeline", f"Wait until {export} has finished: it "
+                                "replaces the videos and Config.toml that the pipeline reads.")
+            return
         self.log_view.clear()
         self.summary.setText("")
         self._set_running(True)
@@ -104,6 +109,7 @@ class RunPage(BasePage):
         self._worker.finished.connect(self._on_finished)
         self._worker.failed.connect(self._on_failed)
         self._thread = run_in_thread(self._worker)
+        self.state.set_busy("pipeline", "the pipeline run (4. Run)")
 
     def _cancel(self):
         if self._worker:
@@ -122,11 +128,13 @@ class RunPage(BasePage):
         self._append(f"  → {res.name}: {mark} {res.message}")
 
     def _on_finished(self, results):
+        self.state.set_busy("pipeline", None)
         self._set_running(False)
         n_ok = sum(1 for r in results if r.ok)
         self.summary.setText(f"Done: {n_ok}/{len(results)} stages ok.")
 
     def _on_failed(self, msg):
+        self.state.set_busy("pipeline", None)
         self._set_running(False)
         self._append(f"[pipeline error] {msg}")
         self.summary.setText(f"Pipeline error: {msg}")

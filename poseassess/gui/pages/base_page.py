@@ -24,3 +24,11 @@ class BasePage(QWidget):
 
     def on_project_changed(self, project) -> None:  # override
         pass
+
+    def can_close(self) -> bool:  # override
+        """Asked by MainWindow before the app closes; return False to cancel (e.g. after asking
+        the user whether to stop a running recording)."""
+        return True
+
+    def shutdown(self) -> None:  # override
+        """Called once when the app closes: stop threads, timers, cameras."""

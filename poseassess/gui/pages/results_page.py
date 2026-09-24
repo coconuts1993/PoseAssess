@@ -4,6 +4,10 @@ Loads a kinematics/*.mot file, shows range-of-motion + left/right symmetry in a
 table (asymmetries flagged), plots each joint's R/L angle curve, and exports the
 report to CSV/JSON. This is the clinical layer that the underlying engines
 (Pose2Sim/OpenSim) don't provide.
+
+The joint angles are in the "Joint angles" tab (unchanged). The "Balance (Wii)" tab holds the
+Wii Balance Board analysis (``BalancePanel``: recording + alignment, COP / COM sway metrics,
+force plots, fused-table export).
 """
 from __future__ import annotations
 
@@ -15,10 +19,11 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QComboBox, QFileDialog, QHBoxLayout, QHeaderView, QLabel, QMessageBox,
-    QPushButton, QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QPushButton, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from poseassess.core.assessment import read_mot, analyze, CLINICAL_JOINTS, AXIAL_JOINTS
+from ..widgets.balance_panel import BalancePanel
 from ..widgets.plot_canvas import PlotCanvas
 from .base_page import BasePage
 
@@ -56,9 +61,11 @@ class ResultsPage(BasePage):
         bar.addWidget(self.export_csv_btn)
         root.addLayout(bar)
 
-        # ---- split: table | plot ----
+        # ---- tabs: joint angles (split: table | plot) | balance (Wii) ----
+        self.tabs = QTabWidget()
+        root.addWidget(self.tabs, 1)
         split = QSplitter(Qt.Horizontal)
-        root.addWidget(split, 1)
+        self.tabs.addTab(split, "Joint angles")
 
         left = QWidget(); lv = QVBoxLayout(left)
         lv.addWidget(QLabel("<b>Range of motion & symmetry</b>"))
@@ -82,11 +89,17 @@ class ResultsPage(BasePage):
         split.addWidget(right)
         split.setSizes([460, 540])
 
+        self.balance = BalancePanel(state)
+        self.tabs.addTab(self.balance, "Balance (Wii)")
+
         self.note = QLabel(
             "<small>Symmetry index = |R−L| ROM / mean ROM. "
             "Flagged (⚠) when > 10%. Not a medical diagnosis.</small>")
         self.note.setWordWrap(True)
         root.addWidget(self.note)
+
+    def shutdown(self) -> None:
+        self.balance.shutdown()
 
     # ---- loading ---------------------------------------------------------- #
     def on_project_changed(self, project):
