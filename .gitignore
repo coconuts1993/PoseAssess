@@ -1,0 +1,13 @@
+python311/
+venv/
+models/
+__pycache__/
+*.pyc
+*.mp4
+*.avi
+*.mkv
+*.onnx
+*.pth
+*.pt
+*.task
+*.zip

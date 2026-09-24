@@ -1,0 +1,39 @@
+ Volume in drive F is Elements
+ Volume Serial Number is 963E-28EA
+
+ Directory of F:\cluade\PoseAssess_Portable\models
+
+2026/08/01  16:17    <DIR>          .
+2026/08/01  16:17    <DIR>          ..
+2026/07/12  22:28    <DIR>          rtmlib
+               0 File(s)              0 bytes
+
+ Directory of F:\cluade\PoseAssess_Portable\models\rtmlib
+
+2026/07/12  22:28    <DIR>          .
+2026/07/12  22:28    <DIR>          ..
+2026/07/12  22:28    <DIR>          hub
+               0 File(s)              0 bytes
+
+ Directory of F:\cluade\PoseAssess_Portable\models\rtmlib\hub
+
+2026/07/12  22:28    <DIR>          .
+2026/07/12  22:28    <DIR>          ..
+2026/07/12  22:35    <DIR>          checkpoints
+               0 File(s)              0 bytes
+
+ Directory of F:\cluade\PoseAssess_Portable\models\rtmlib\hub\checkpoints
+
+2026/07/12  22:35    <DIR>          .
+2026/07/12  22:35    <DIR>          ..
+2026/07/12  22:31        55,685,444 rtmpose-m_simcc-body7_pt-body7-halpe26_700e-256x192-4d3e73dd_20230605.onnx
+2026/07/12  22:28        22,793,379 rtmpose-s_simcc-body7_pt-body7-halpe26_700e-256x192-7f134165_20230605.onnx
+2026/07/12  22:35       199,918,283 rtmpose-x_simcc-body7_pt-body7-halpe26_700e-384x288-7fb6e239_20230606.onnx
+2026/07/12  22:30       101,400,344 yolox_m_8xb8-300e_humanart-c2c7a14a.onnx
+2026/07/12  22:28        20,283,006 yolox_tiny_8xb8-300e_humanart-6f3252f9.onnx
+2026/07/12  22:34       396,283,264 yolox_x_8xb8-300e_humanart-a39d44ed.onnx
+               6 File(s)    796,363,720 bytes
+
+     Total Files Listed:
+               6 File(s)    796,363,720 bytes
+              11 Dir(s)  3,498,538,409,984 bytes free
