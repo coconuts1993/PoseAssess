@@ -1,0 +1,120 @@
+name: Build portable Windows bundle
+
+# Builds the same self-contained folder as the original PoseAssess_Portable
+# (python311\ + venv\ + poseassess\ + models\ + run.bat), smoke-tests it after moving it to
+# another folder (as a user would), and uploads it as a zip.
+
+on:
+  push:
+    branches: [main, "claude/**"]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  portable:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      PYTHONUTF8: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      BUNDLE: ${{ github.workspace }}\build\PoseAssess_Portable
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Copy Python into the bundle (python311\)
+        shell: pwsh
+        run: |
+          $py = python -c "import sys; print(sys.base_prefix)"
+          New-Item -ItemType Directory -Force $env:BUNDLE | Out-Null
+          Copy-Item -Recurse $py "$env:BUNDLE\python311"
+          & "$env:BUNDLE\python311\python.exe" --version
+
+      - name: Create venv\ and install the pinned dependencies
+        shell: pwsh
+        run: |
+          & "$env:BUNDLE\python311\python.exe" -m venv "$env:BUNDLE\venv"
+          $vpy = "$env:BUNDLE\venv\Scripts\python.exe"
+          & $vpy -m pip install --upgrade pip
+          & $vpy -m pip install -r requirements-portable.txt
+          if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
+          # rtmlib / mediapipe may pull in opencv-python next to opencv-contrib-python: keep one cv2
+          & $vpy -m pip uninstall -y opencv-python opencv-python-headless
+          & $vpy -m pip install --force-reinstall --no-deps opencv-contrib-python==4.11.0.86
+          & $vpy -m pip list
+
+      - name: Add the application and the 2D-pose models
+        shell: pwsh
+        run: |
+          Copy-Item -Recurse poseassess "$env:BUNDLE\poseassess"
+          Get-ChildItem -Recurse -Directory -Filter __pycache__ "$env:BUNDLE\poseassess" | Remove-Item -Recurse -Force
+          foreach ($f in 'run.bat', 'run_wii.bat', 'README_DEPLOY.txt', 'requirements-wii.txt', 'requirements-portable.txt') { Copy-Item $f $env:BUNDLE }
+          if (Test-Path docs) { Copy-Item -Recurse docs "$env:BUNDLE\docs" }
+          & "$env:BUNDLE\venv\Scripts\python.exe" .github\portable\fetch_models.py "$env:BUNDLE\models\rtmlib\hub\checkpoints"
+          if ($LASTEXITCODE -ne 0) { throw "model download failed" }
+          Get-ChildItem -Recurse -Filter *.zip "$env:BUNDLE\models" | Remove-Item -Force
+
+      - name: Tests with the bundle's Python
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          $vpy = "$env:BUNDLE\venv\Scripts\python.exe"
+          & $vpy -m pip install pytest
+          $env:PYTHONPATH = "$env:GITHUB_WORKSPACE"
+          & $vpy -m pytest -q -rs tests
+          $code = $LASTEXITCODE
+          & $vpy -m pip uninstall -y pytest iniconfig pluggy
+          if ($code -ne 0) { throw "tests failed" }
+
+      - name: Move the bundle and smoke-test it like run.bat does
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          $moved = "$env:RUNNER_TEMP\moved\PoseAssess_Portable"
+          New-Item -ItemType Directory -Force (Split-Path $moved) | Out-Null
+          Move-Item $env:BUNDLE $moved
+          # run.bat step 1: point the venv at the bundled Python wherever the folder is
+          @("home = $moved\python311", "include-system-site-packages = false", "version = 3.11.3",
+            "executable = $moved\python311\python.exe") | Set-Content -Encoding ascii "$moved\venv\pyvenv.cfg"
+          $env:PYTHONPATH = $moved
+          Push-Location $moved
+          & "$moved\venv\Scripts\python.exe" "$env:GITHUB_WORKSPACE\.github\portable\smoketest.py" $moved
+          if ($LASTEXITCODE -ne 0) { throw "smoke test failed" }
+          & "$moved\venv\Scripts\python.exe" -m poseassess.wii --simulate --seconds 2 --out "$env:RUNNER_TEMP\wii_selftest"
+          if ($LASTEXITCODE -ne 0) { throw "Wii recorder failed" }
+          $csv = Get-ChildItem -Recurse "$env:RUNNER_TEMP\wii_selftest" -Filter wii.csv | Select-Object -First 1
+          if (-not $csv) { throw "wii.csv was not written" }
+          Get-Content $csv.FullName -TotalCount 3
+          Pop-Location
+          # leave pyvenv.cfg as run.bat would rewrite it anyway; clean caches written by the test
+          Get-ChildItem -Recurse -Directory -Filter __pycache__ "$moved\poseassess" | Remove-Item -Recurse -Force
+          Move-Item $moved $env:BUNDLE
+
+      - name: Zip
+        shell: pwsh
+        run: |
+          Push-Location (Split-Path $env:BUNDLE)
+          7z a -tzip -mx=5 "$env:GITHUB_WORKSPACE\PoseAssess_Portable_win64.zip" PoseAssess_Portable | Select-Object -Last 3
+          Pop-Location
+          "{0:N0} MB" -f ((Get-Item PoseAssess_Portable_win64.zip).Length / 1MB)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PoseAssess_Portable_win64
+          path: PoseAssess_Portable_win64.zip
+          retention-days: 30
+          compression-level: 0
+
+      - name: Attach to GitHub release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: PoseAssess_Portable_win64.zip
