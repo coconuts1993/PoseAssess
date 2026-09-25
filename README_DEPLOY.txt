@@ -129,3 +129,24 @@ Everything else works exactly as before.
    cameras and the board together) -> 4. Run -> 5. 3D View (board, centre
    of pressure, force arrow, centre of mass) -> 6. Results > Balance (Wii)
    (sway metrics, plots, export).
+
+WII DATA: COMPUTER TIME AND FILES OF THE ORIGINAL WII PROGRAM
+------------------------------------------------------------
+  * Every time-stamped file PoseAssess writes (wii.csv, events.csv,
+    camNN_timestamps.csv, frames.csv) ends with a column "time_local": the
+    recording PC's date and time of that row, e.g.
+    "2026-09-25 14:03:12.345+08:00" (t_unix holds the same instant as Unix
+    seconds). Recordings made on different programs / PCs can be matched by it
+    (as far as the PCs' clocks agree).
+  * Files of the original Wii program (text, no header, 8 columns:
+    ms TL TR BL BR copx_cm copy_cm total_kg) can be imported:
+    6. Results > Balance (Wii) > Import Wii recording... > "wii.csv or
+    original Wii program file...". They are converted to wii.csv; the
+    original is kept as original_<name> in the recording folder.
+  * Those files contain no computer time (the first column is a millisecond
+    counter of that program). PoseAssess ESTIMATES it from the file's
+    modification time (= time of the last sample), so import the original file
+    from the PC it was recorded on (copying keeps the time; e-mail / upload
+    does not). session.json then says clock_source = file_mtime and
+    clock_estimated = true. For an exact alignment use a sync event (2 small
+    jumps or stomps) as described above.

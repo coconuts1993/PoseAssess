@@ -20,6 +20,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from poseassess.wii import io as wio
+
 log = logging.getLogger(__name__)
 
 VIDEO_EXT = ".mkv"
@@ -225,8 +227,9 @@ class CameraStream:
             self.dropped_frames += 1
             return
         self._writer.write(img)
+        t_unix = t + self._rec_offset
         self._ts_writer.writerow([self._rec_index, f"{t:.6f}", f"{t - self._rec_t0:.6f}",
-                                  f"{t + self._rec_offset:.6f}"])
+                                  f"{t_unix:.6f}", wio.local_time(t_unix)])
         self._rec_index += 1
         if t - self._last_flush >= FLUSH_INTERVAL_S:
             self._ts_file.flush()
@@ -259,7 +262,7 @@ class CameraStream:
             writer.release()
             raise
         ts_writer = csv.writer(ts_file)
-        ts_writer.writerow(["frame", "t", "t_rel", "t_unix"])
+        ts_writer.writerow(wio.TIMESTAMPS_HEADER)
         with self._lock:
             self._writer, self._ts_file, self._ts_writer, self._rec_index = writer, ts_file, ts_writer, 0
             self._rec_offset = float(clock_offset_unix)

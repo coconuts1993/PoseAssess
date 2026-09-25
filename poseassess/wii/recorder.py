@@ -417,11 +417,11 @@ class WiiRecorder:
                 if self._board is not None and np.all(np.isfinite(s.cop_board)):
                     cw = self._board.board_to_world.apply(
                         np.array([s.cop_board[0], s.cop_board[1], 0.0]))
-                self._wii_csv.writerow([f"{s.t:.6f}", f"{s.t - self.t0:.6f}",
-                                        f"{s.t + self.clock_offset_unix:.6f}",
+                t_unix = s.t + self.clock_offset_unix
+                self._wii_csv.writerow([f"{s.t:.6f}", f"{s.t - self.t0:.6f}", f"{t_unix:.6f}",
                                         *[_f(v) for v in s.kg], _f(s.total_kg),
                                         _f(s.cop_board[0]), _f(s.cop_board[1]),
-                                        *[_f(v) for v in cw]])
+                                        *[_f(v) for v in cw], wio.local_time(t_unix)])
                 self.counts["wii"] += 1
                 if s.t - self._flushed >= FLUSH_INTERVAL_S:
                     self._wii_file.flush()
@@ -464,7 +464,8 @@ class WiiRecorder:
                     self._events_csv = csv.writer(self._events_file)
                     self._events_csv.writerow(wio.EVENTS_HEADER)
                 self._events_csv.writerow([f"{ev['t']:.6f}", f"{ev['t_rel']:.6f}",
-                                           f"{ev['t_unix']:.6f}", label])
+                                           f"{ev['t_unix']:.6f}", label,
+                                           wio.local_time(ev["t_unix"])])
                 self._events_file.flush()  # markers are rare and valuable
             except OSError as e:
                 msg = f"{wio.EVENTS_CSV}: {e}"

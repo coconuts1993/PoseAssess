@@ -18,7 +18,9 @@ Clock: every time column uses one clock per recording. ``t`` = ``time.perf_count
 recording PC (s), ``t_rel = t - t0`` (s since the recording started), ``t_unix = t +
 clock_offset_unix`` (Unix time, s; the offset is measured once at start). Empty fields are NaN.
 Imported recordings (another PC / PoseBoard) keep their own ``t``; only ``t_rel`` and
-``t_unix`` are meaningful across programs.
+``t_unix`` are meaningful across programs. The last column ``time_local`` repeats ``t_unix`` as the
+recording PC's local date and time (``2026-09-25 14:03:12.345+08:00``) so the computer time is
+readable in Excel; readers use ``t_unix``.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ import csv
 import json
 import os
 import time
+from datetime import datetime
 from io import StringIO
 from pathlib import Path
 
@@ -40,14 +43,29 @@ TIMESTAMPS_SUFFIX = "_timestamps.csv"
 
 SESSION_SCHEMA = "poseassess.wii.session/1"
 
+TIME_LOCAL = "time_local"  # last column of every time-stamped CSV: t_unix as local date/time
 WII_HEADER = ["t", "t_rel", "t_unix", "TR_kg", "BR_kg", "TL_kg", "BL_kg", "total_kg",
-              "cop_x_board", "cop_y_board", "cop_x_world", "cop_y_world", "cop_z_world"]
+              "cop_x_board", "cop_y_board", "cop_x_world", "cop_y_world", "cop_z_world",
+              TIME_LOCAL]
 SENSOR_COLS = ["TR_kg", "BR_kg", "TL_kg", "BL_kg"]  # same order as ForceSample.kg
-EVENTS_HEADER = ["t", "t_rel", "t_unix", "label"]
-TIMESTAMPS_HEADER = ["frame", "t", "t_rel", "t_unix"]
+EVENTS_HEADER = ["t", "t_rel", "t_unix", "label", TIME_LOCAL]
+TIMESTAMPS_HEADER = ["frame", "t", "t_rel", "t_unix", TIME_LOCAL]
 # frames.csv: FRAMES_HEADER_BASE, then for each exported camera "<cam>_src" (source frame index
-# in <cam>.mkv, -1 when none) and "<cam>_dt_ms" (source frame time minus grid time, ms).
+# in <cam>.mkv, -1 when none) and "<cam>_dt_ms" (source frame time minus grid time, ms), then
+# TIME_LOCAL.
 FRAMES_HEADER_BASE = ["frame", "t", "t_rel", "t_unix"]
+
+
+def local_time(t_unix: float | None) -> str:
+    """``t_unix`` as the local date and time of this PC with milliseconds and UTC offset,
+    e.g. ``2026-09-25 14:03:12.345+08:00``; "" when unknown."""
+    try:
+        if t_unix is None or not np.isfinite(t_unix):
+            return ""
+        return datetime.fromtimestamp(float(t_unix)).astimezone().isoformat(
+            sep=" ", timespec="milliseconds")
+    except (OverflowError, OSError, ValueError):
+        return ""
 
 
 def timestamps_csv_name(cam: str) -> str:

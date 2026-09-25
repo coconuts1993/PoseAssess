@@ -195,6 +195,9 @@ def import_recording(project, src: str | Path, name: str | None = None,
         raise ValueError(f"{src} does not exist.")
     if not wii_file.is_file():
         raise ValueError(f"{src} is not a Wii recording: it has no {wio.WII_CSV}.")
+    from poseassess.wii import legacy
+    if folder is None and legacy.is_legacy_wii_file(wii_file):
+        return _import_legacy(project, wii_file, name or default_name, make_active)
     try:
         cols = wio.read_csv_columns(wii_file)
     except (OSError, UnicodeDecodeError, csv.Error) as e:
@@ -273,6 +276,45 @@ def import_recording(project, src: str | Path, name: str | None = None,
     return rec_id
 
 
+def _import_legacy(project, src: Path, name: str, make_active: bool) -> str:
+    """Import a file of the lab's original Wii program (``poseassess.wii.legacy``): converted
+    to wii.csv (computer time estimated from the file's modification time), the original file
+    kept next to it as ``original_<name>``."""
+    from poseassess.wii import io as wio
+    from poseassess.wii import legacy
+
+    paths = WiiPaths(project)
+    cols, lmeta = legacy.read_legacy_wii(src)
+    base = _safe_id(name)
+    rec_id, k = base, 2
+    while paths.recording_dir(rec_id).exists():
+        rec_id, k = f"{base}_{k}", k + 1
+    dst = paths.recording_dir(rec_id)
+    dst.mkdir(parents=True)
+    try:
+        sensors = [cols[c] for c in wio.SENSOR_COLS]
+        _write_normalized_wii_csv(dst / wio.WII_CSV, cols, cols["t_rel"], cols["total_kg"],
+                                  sensors, {})
+        shutil.copy2(src, dst / f"original_{src.name}")
+        t = cols["t"]
+        off = lmeta.get("clock_offset_unix")
+        meta = {"schema": wio.SESSION_SCHEMA, "app": "imported (original Wii program)",
+                "created": now_iso(), "subject": "", "notes": "", "t0": float(t[0]),
+                "t0_unix": None if off is None else float(t[0] + off),
+                "start_time_iso": "" if off is None else wio.local_time(t[0] + off),
+                "has_wii": True, "has_video": False, "camera_names": [], "streams": [],
+                "duration_s": float(t[-1] - t[0]), "samples": {"wii": int(len(t)), "events": 0},
+                **lmeta,
+                "imported_from": str(src.resolve()), "imported_time": now_iso()}
+        wio.write_session_json(dst, meta)
+    except Exception:
+        shutil.rmtree(dst, ignore_errors=True)
+        raise
+    if make_active:
+        set_recording(project, rec_id, source="external")
+    return rec_id
+
+
 def _write_normalized_wii_csv(path: Path, cols: dict, t_rel: np.ndarray, total: np.ndarray,
                               sensors: list, meta: dict) -> None:
     """wii.csv in WII_HEADER order with t_rel / total_kg / board COP filled in."""
@@ -301,5 +343,6 @@ def _write_normalized_wii_csv(path: Path, cols: dict, t_rel: np.ndarray, total: 
         w = csv.writer(f)
         w.writerow(wio.WII_HEADER)
         for i in order:
-            w.writerow(["" if not np.isfinite(out[h][i]) else f"{out[h][i]:.6f}"
+            w.writerow([wio.local_time(out["t_unix"][i]) if h == wio.TIME_LOCAL
+                        else "" if not np.isfinite(out[h][i]) else f"{out[h][i]:.6f}"
                         for h in wio.WII_HEADER])

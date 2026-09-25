@@ -371,6 +371,7 @@ def _write_frames_csv(path: Path, plan: ExportPlan) -> None:
     head = list(wio.FRAMES_HEADER_BASE)
     for c in plan.cameras:
         head += [f"{c}_src", f"{c}_dt_ms"]
+    head.append(wio.TIME_LOCAL)
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(head)
@@ -378,6 +379,7 @@ def _write_frames_csv(path: Path, plan: ExportPlan) -> None:
             row = [k, _f6(plan.t_grid[k]), _f6(plan.t_rel[k]), _f6(plan.t_unix[k])]
             for c in plan.cameras:
                 row += [int(plan.src[c][k]), _f6(plan.dt_ms[c][k])]
+            row.append(wio.local_time(plan.t_unix[k]))
             w.writerow(row)
 
 

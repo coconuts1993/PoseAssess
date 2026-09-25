@@ -134,7 +134,7 @@ class AlignmentPanel(QWidget):
             "this trial.")
         menu = QMenu(self.import_btn)
         menu.addAction("Recording folder…", lambda: self._import("folder"))
-        menu.addAction("wii.csv file…", lambda: self._import("file"))
+        menu.addAction("wii.csv or original Wii program file…", lambda: self._import("file"))
         self.import_btn.setMenu(menu)
         self.open_btn = QPushButton("Open folder")
         self.open_btn.setToolTip("Open the recording folder in the file manager.")
@@ -434,8 +434,9 @@ class AlignmentPanel(QWidget):
         if kind == "folder":
             src = QFileDialog.getExistingDirectory(self, "Import Wii recording (folder)", start)
         else:
-            src, _ = QFileDialog.getOpenFileName(self, "Import Wii recording (wii.csv)", start,
-                                                 "Wii data (*.csv)")
+            src, _ = QFileDialog.getOpenFileName(
+                self, "Import Wii recording (wii.csv or a file of the original Wii program)",
+                start, "Wii data (*.csv *.txt *.dat);;All files (*)")
         if not src:
             return
         self.import_path(src)
