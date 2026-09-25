@@ -60,16 +60,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "model download failed" }
           Get-ChildItem -Recurse -Filter *.zip "$env:BUNDLE\models" | Remove-Item -Force
 
-      - name: GUI size diagnostics (offscreen and native Windows platform)
+      - name: Window size check (native Windows platform, fits a 1400 px wide screen area)
         shell: pwsh
-        continue-on-error: true
         run: |
           $vpy = "$env:BUNDLE\venv\Scripts\python.exe"
           $env:PYTHONPATH = "$env:GITHUB_WORKSPACE"
-          foreach ($plat in 'offscreen', 'windows') {
-            $env:QT_QPA_PLATFORM = $plat
-            & $vpy .github\portable\gui_sizes.py 1.0
-          }
+          $env:QT_QPA_PLATFORM = 'windows'
+          & $vpy .github\portable\gui_sizes.py --max 1400
+          if ($LASTEXITCODE -ne 0) { throw "main window too wide" }
 
       - name: Tests with the bundle's Python
         shell: pwsh

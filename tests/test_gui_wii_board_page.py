@@ -563,7 +563,13 @@ def test_page_in_main_window_close_hooks(qapp, demo_trial):
     from poseassess.core.balance.board import load_clicks
 
     assert len(load_clicks(demo_trial["project"], 1).points) == 4  # saved on close
-    assert w.minimumSizeHint().width() < 1400
+    from PySide6.QtWidgets import QApplication
+
+    # Qt's "offscreen" platform on Windows has no real fonts (falls back to a much wider one), so
+    # widths there are meaningless: 2128 px vs 1068 px with the native "windows" platform on the
+    # same CI machine. CI checks the native width with .github/portable/gui_sizes.py instead.
+    if not (sys.platform.startswith("win") and QApplication.platformName() == "offscreen"):
+        assert w.minimumSizeHint().width() < 1400
 
 
 def test_exploring_another_frame_keeps_the_complete_clicks(env, demo_trial):
