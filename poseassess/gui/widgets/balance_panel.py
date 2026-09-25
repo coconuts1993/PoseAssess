@@ -485,13 +485,21 @@ class BalancePanel(QWidget):
 
     def _fill_events_menu(self) -> None:
         self.events_menu.clear()
+        for m in getattr(self, "_event_submenus", ()):
+            m.deleteLater()
+        self._event_submenus = ()
         evs = self._event_list()
         if not evs:
             a = self.events_menu.addAction("No events in this trial")
             a.setEnabled(False)
             return
-        start = self.events_menu.addMenu("Start at")
-        end = self.events_menu.addMenu("End at")
+        # Submenus parented to events_menu and referenced here: a menu returned by
+        # QMenu.addMenu(title) can be deleted with its Python wrapper on some PySide6 versions
+        start = QMenu("Start at", self.events_menu)
+        end = QMenu("End at", self.events_menu)
+        self.events_menu.addMenu(start)
+        self.events_menu.addMenu(end)
+        self._event_submenus = (start, end)
         for label, t in evs:
             start.addAction(f"{label}  ({t:.2f} s)",
                             lambda t=t: self.set_window(t, max(t, self.to_spin.value())))
