@@ -68,10 +68,19 @@ jobs:
           $vpy = "$env:BUNDLE\venv\Scripts\python.exe"
           & $vpy -m pip install pytest
           $env:PYTHONPATH = "$env:GITHUB_WORKSPACE"
-          & $vpy -m pytest -q -rs tests
-          $code = $LASTEXITCODE
+          $env:PYTHONFAULTHANDLER = "1"
+          # One process per test file: a native crash is attributed to its file and does not
+          # hide the results of the other files
+          $failed = @()
+          foreach ($f in (Get-ChildItem tests -Filter "test_*.py" | Sort-Object Name)) {
+            Write-Host "::group::$($f.Name)"
+            & $vpy -m pytest -v -rfEs -p no:cacheprovider $f.FullName
+            $code = $LASTEXITCODE
+            Write-Host "::endgroup::"
+            if ($code -ne 0 -and $code -ne 5) { $failed += "$($f.Name) (exit $code)"; Write-Host "FAILED FILE: $($f.Name) exit $code" }
+          }
           & $vpy -m pip uninstall -y pytest iniconfig pluggy
-          if ($code -ne 0) { throw "tests failed" }
+          if ($failed.Count) { throw "test files failed: $($failed -join ', ')" }
 
       - name: Move the bundle and smoke-test it like run.bat does
         shell: pwsh
