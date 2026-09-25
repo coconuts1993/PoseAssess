@@ -150,3 +150,14 @@ WII DATA: COMPUTER TIME AND FILES OF THE ORIGINAL WII PROGRAM
     does not). session.json then says clock_source = file_mtime and
     clock_estimated = true. For an exact alignment use a sync event (2 small
     jumps or stomps) as described above.
+
+WII RECORDING REPLAY (NO BOARD NEEDED)
+--------------------------------------
+  * In the app (run.bat): 2b. Wii Board > "Replay file" tab > Open recording...
+    (or drop a file on it). Stand-alone: double-click run_wii_viewer.bat, or
+    drag a file onto it.
+  * Opens files of the original Wii program, a wii.csv or a recording folder
+    and replays the centre-of-pressure trajectory in real time on the board
+    (trail 1-30 s or all), with the load / COP curves, the four sensors and
+    COP sway figures. Speed 0.25x-4x; Space = play/pause, Left/Right = -/+1 s,
+    Home = start. Opening a file jumps to 1 s before the subject steps on.

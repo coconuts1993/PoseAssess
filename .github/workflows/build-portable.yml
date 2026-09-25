@@ -54,7 +54,7 @@ jobs:
         run: |
           Copy-Item -Recurse poseassess "$env:BUNDLE\poseassess"
           Get-ChildItem -Recurse -Directory -Filter __pycache__ "$env:BUNDLE\poseassess" | Remove-Item -Recurse -Force
-          foreach ($f in 'run.bat', 'run_wii.bat', 'README_DEPLOY.txt', 'requirements-wii.txt', 'requirements-portable.txt') { Copy-Item $f $env:BUNDLE }
+          foreach ($f in 'run.bat', 'run_wii.bat', 'run_wii_viewer.bat', 'README_DEPLOY.txt', 'requirements-wii.txt', 'requirements-portable.txt') { Copy-Item $f $env:BUNDLE }
           if (Test-Path docs) { Copy-Item -Recurse docs "$env:BUNDLE\docs" }
           & "$env:BUNDLE\venv\Scripts\python.exe" .github\portable\fetch_models.py "$env:BUNDLE\models\rtmlib\hub\checkpoints"
           if ($LASTEXITCODE -ne 0) { throw "model download failed" }

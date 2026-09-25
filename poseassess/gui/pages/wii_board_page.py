@@ -283,6 +283,10 @@ class WiiBoardPage(BasePage):
         self.board_tab = self._build_board_tab()
         self.tabs.addTab(self.device_tab, "Device && live COP")
         self.tabs.addTab(self.board_tab, "Board location")
+        # Replay of a recording file (original Wii program / wii.csv): no board needed
+        from ..widgets.wii_replay import WiiReplayWidget
+        self.replay_tab = WiiReplayWidget()
+        self.tabs.addTab(self.replay_tab, "Replay file")
         root.addWidget(self.tabs)
 
         self._live = QTimer(self)
@@ -762,6 +766,8 @@ class WiiBoardPage(BasePage):
 
     # ============================================================ project
     def on_project_changed(self, project) -> None:
+        if project is not None:  # open dialog of the replay starts in the project's Wii folder
+            self.replay_tab.start_dir = str(Path(project.root) / "wii" / "recordings")
         self._autosave()
         self._cancel_corner("Corner check cancelled (project changed).")
         old = self._project
@@ -1634,6 +1640,7 @@ class WiiBoardPage(BasePage):
         self._autosave()
 
     def shutdown(self) -> None:
+        self.replay_tab.shutdown()
         self._live.stop()
         self._corner = None
         self._corner_timer.stop()
