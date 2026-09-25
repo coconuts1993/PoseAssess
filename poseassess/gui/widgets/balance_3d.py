@@ -1,6 +1,7 @@
 """``BalanceSkeleton3DViewer``: the 3D View skeleton player + Wii overlays (board, COP point and
 trail, ground reaction force arrow, whole-body COM with plumb line), synchronized with the .trc
-playback.
+playback, and two coordinate frames ("Axes"): the 3D-pose world frame (Calib.toml origin,
+X / Y / Z, Z up) and the Wii board frame (board centre, x = subject's right, y = front, z = up).
 
 Owner: GUI-VIEW. Subclass of ``Skeleton3DViewer`` so the original viewer keeps its behaviour:
 * ``load_trc``: super(), then re-transform static items (the display transform ``_M``/``_center``
@@ -13,8 +14,8 @@ Transforms (docs/WII_INTEGRATION.md, "Coordinate frames"): world point P ->
 Toggles ("Board", "COP", "Force", "COM") go in the transport row next to "Cameras".
 The GL background renders LIGHT (see the 3D View quirk): use dark / saturated overlay colours.
 
-Without balance data (``set_balance`` never called, or ``clear_balance``) no GL item is created
-and the toggles stay hidden, so the viewer looks exactly like ``Skeleton3DViewer``.
+Without balance data (``set_balance`` never called, or ``clear_balance``) no balance GL item is
+created and the balance toggles stay hidden; only the world axes (toggle "Axes") are added.
 """
 
 from __future__ import annotations
@@ -38,8 +39,14 @@ LIFT_M = 0.002           # COP / force drawn this far above the top surface (no 
 ARROW_M_PER_KG = 0.005   # = fusion.COP_ARROW_M_PER_KG (local copy: no core import at startup)
 HEAD_LEN_M = 0.06        # force arrow head length (at most 40 % of the arrow)
 HEAD_RADIUS_M = 0.022
-FRAME_ITEMS = ("cop", "cop_trail", "force", "force_head", "com", "plumb", "plumb_foot")
+FRAME_ITEMS = ("cop", "cop_trail", "force", "force_head", "force_label", "com", "plumb",
+               "plumb_foot")
 BOARD_ITEMS = ("surface", "outline", "front", "sensors", "front_label")
+BOARD_AXES_ITEMS = ("board_axes", "board_axes_x", "board_axes_y", "board_axes_z")
+WORLD_AXES_ITEMS = ("world_axes", "world_axes_x", "world_axes_y", "world_axes_z", "world_origin")
+AXIS_COLORS = ("#d62728", "#8cc63f", "#1f5fd6")  # x, y, z (red, lime: not the force green, blue)
+WORLD_AXIS_M = 0.5       # world axes length
+BOARD_AXIS_M = 0.25      # board axes length
 
 
 def _rgba(hex_color: str, alpha: float = 1.0) -> tuple[float, float, float, float]:
@@ -103,6 +110,18 @@ class BalanceSkeleton3DViewer(Skeleton3DViewer):
         self._toggles = (self.board_check, self.cop_check, self.force_check, self.com_check)
         for chk in self._toggles:
             row.addWidget(chk)
+        self._axes_items: dict[str, object] = {}
+        self.axes_check = QCheckBox("Axes")
+        self.axes_check.setChecked(True)
+        self.axes_check.setVisible(False)  # shown once a .trc is loaded
+        self.axes_check.setToolTip(
+            "Coordinate frames (x red, y lime green, z blue). Thick, 0.5 m, labels X / Y / Z: the "
+            "3D-pose world frame (origin of the calibration checkerboard, Z up). Thin, 0.25 m, "
+            "labels x / y / z Wii: the Wii board frame (board centre, x = subject's right, y = "
+            "front edge, z = up); the COP and the force are measured in this frame.")
+        self.axes_check.setStyleSheet("QCheckBox { font-weight: 600; }")
+        self.axes_check.toggled.connect(self._update_axes)
+        row.addWidget(self.axes_check)
 
         # per-frame read-out under the legend (hidden until there is fused data)
         self.balance_info = QLabel("")
@@ -169,6 +188,9 @@ class BalanceSkeleton3DViewer(Skeleton3DViewer):
         it["force_head"] = gl.GLMeshItem(vertexes=np.zeros((3, 3)), faces=np.array([[0, 1, 2]]),
                                          color=_rgba(FORCE_COLOR), smooth=False,
                                          drawEdges=False, glOptions=tr)
+        if _HAS_TEXT:
+            from pyqtgraph.opengl import GLTextItem
+            it["force_label"] = GLTextItem(text="", color=(26, 154, 58, 255))
         it["cop"] = gl.GLScatterPlotItem(size=15.0, pxMode=True, color=_rgba(COP_COLOR),
                                          glOptions=tr)
         it["plumb"] = gl.GLLinePlotItem(mode="lines", width=2.0, antialias=True,
@@ -211,6 +233,7 @@ class BalanceSkeleton3DViewer(Skeleton3DViewer):
                 has_cop = bool(np.isfinite(fused.cop_world).all(axis=1).any())
                 has_force = bool(np.isfinite(fused.force_world).all(axis=1).any())
         self.board_check.setVisible(board is not None)
+        self._update_axes()
         self.cop_check.setVisible(has_cop)
         self.force_check.setVisible(has_force)
         self.com_check.setVisible(has_com)
@@ -229,6 +252,7 @@ class BalanceSkeleton3DViewer(Skeleton3DViewer):
             chk.setVisible(False)
         self.balance_info.setVisible(False)
         self.balance_info.setText("")
+        self._update_axes()
 
     @property
     def balance_row(self) -> int:
@@ -244,11 +268,16 @@ class BalanceSkeleton3DViewer(Skeleton3DViewer):
         if ok and self._bal_items:
             self._update_board_items()  # the display transform changed
             self._update_balance_frame()
+        if ok:
+            self.axes_check.setVisible(True)
+            self._update_axes()
         return ok
 
     def clear(self):
         super().clear()
         self.clear_balance()
+        self.axes_check.setVisible(False)
+        self._update_axes()
 
     def _show_frame(self, i: int):
         super()._show_frame(i)
@@ -302,6 +331,95 @@ class BalanceSkeleton3DViewer(Skeleton3DViewer):
             pos = corners[0] + (out * 0.06 if out is not None else 0.0) + up * 0.01
             it["front_label"].setData(pos=pos)
         self._set_visible(BOARD_ITEMS, True)
+
+    # ---- coordinate frames ---------------------------------------------------- #
+    def _ensure_axes(self) -> None:
+        if self._axes_items:
+            return
+        from OpenGL import GL
+
+        tr = {GL.GL_DEPTH_TEST: False, GL.GL_BLEND: True,
+              "glBlendFuncSeparate": (GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA,
+                                      GL.GL_ONE, GL.GL_ONE_MINUS_SRC_ALPHA)}
+        it: dict[str, object] = {
+            "world_axes": gl.GLLinePlotItem(mode="lines", width=4.0, antialias=True,
+                                            glOptions=tr),
+            "board_axes": gl.GLLinePlotItem(mode="lines", width=2.5, antialias=True,
+                                            glOptions=tr)}
+        if _HAS_TEXT:
+            from pyqtgraph.opengl import GLTextItem
+
+            for frame, names in (("world", ("X", "Y", "Z")),
+                                 ("board", ("x Wii", "y Wii", "z Wii"))):
+                for axis, name, col in zip("xyz", names, AXIS_COLORS):
+                    rgb = tuple(int(255 * c) for c in _rgba(col)[:3])
+                    it[f"{frame}_axes_{axis}"] = GLTextItem(text=name, color=(*rgb, 255))
+            it["world_origin"] = GLTextItem(text="O world", color=(60, 60, 60, 255))
+        for item in it.values():
+            item.setVisible(False)
+            self.view.addItem(item)
+        self._axes_items = it
+
+    def _axes_set_visible(self, names, on: bool) -> None:
+        for n in names:
+            if n in self._axes_items:
+                self._axes_items[n].setVisible(on)
+
+    def _draw_frame(self, prefix: str, origin: np.ndarray, dirs: np.ndarray,
+                    length: float) -> None:
+        """Axes ``prefix`` ("world" / "board") at display point ``origin`` along the display
+        directions ``dirs`` (3,3 rows x, y, z; unit)."""
+        it = self._axes_items
+        tips = origin + dirs * length
+        seg = np.empty((6, 3))
+        seg[0::2], seg[1::2] = origin, tips
+        col = np.repeat(np.array([_rgba(c) for c in AXIS_COLORS]), 2, axis=0)
+        it[f"{prefix}_axes"].setData(pos=seg, color=col)
+        for axis, tip in zip("xyz", tips):
+            key = f"{prefix}_axes_{axis}"
+            if key in it:
+                it[key].setData(pos=tip + (tip - origin) * 0.08)
+
+    def world_axes_display(self) -> tuple[np.ndarray, np.ndarray]:
+        """World frame in display coordinates: origin (3,) and unit axes (3,3) rows X, Y, Z."""
+        origin = self._disp(np.zeros(3))[0]
+        dirs = np.array([self._disp_dir(e) for e in np.eye(3)])
+        return origin, dirs
+
+    def board_axes_display(self) -> tuple[np.ndarray, np.ndarray] | None:
+        """Board frame in display coordinates (origin = board centre on the top surface), or
+        None without a board registration."""
+        reg = self._board
+        if reg is None:
+            return None
+        T = reg.pose.board_to_world
+        o_w = np.asarray(T.apply(np.zeros((1, 3))), float).reshape(3)
+        e_w = np.asarray(T.apply(np.eye(3)), float).reshape(3, 3) - o_w
+        dirs = np.array([_unit(self._disp_dir(e)) for e in e_w])
+        return self._disp(o_w)[0], dirs
+
+    def _update_axes(self, *_):
+        if self._trc is None or not self.axes_check.isChecked():
+            self._axes_set_visible(WORLD_AXES_ITEMS + BOARD_AXES_ITEMS, False)
+            return
+        self._ensure_axes()
+        try:
+            origin, dirs = self.world_axes_display()
+            self._draw_frame("world", origin, dirs, WORLD_AXIS_M)
+            if "world_origin" in self._axes_items:
+                self._axes_items["world_origin"].setData(pos=origin - dirs[2] * 0.05)
+            self._axes_set_visible(WORLD_AXES_ITEMS, True)
+            board = self.board_axes_display()
+        except Exception:  # noqa: BLE001  (the axes must never break the viewer)
+            log.exception("cannot draw the axes")
+            self._axes_set_visible(WORLD_AXES_ITEMS + BOARD_AXES_ITEMS, False)
+            return
+        if board is None or any(d is None for d in board[1]):
+            self._axes_set_visible(BOARD_AXES_ITEMS, False)
+            return
+        o, d = board
+        self._draw_frame("board", o + d[2] * LIFT_M * 2, d, BOARD_AXIS_M)
+        self._axes_set_visible(BOARD_AXES_ITEMS, True)
 
     def _update_balance_frame(self) -> None:
         if not self._bal_items:
@@ -371,6 +489,10 @@ class BalanceSkeleton3DViewer(Skeleton3DViewer):
         it["force_head"].setMeshData(vertexes=verts, faces=faces, color=_rgba(FORCE_COLOR))
         it["force"].setVisible(True)
         it["force_head"].setVisible(True)
+        if "force_label" in it:
+            it["force_label"].setData(pos=tip + axis * 0.03,
+                                      text=f"{total:.1f} kg · {total * 9.80665:.0f} N")
+            it["force_label"].setVisible(True)
 
     def _draw_com(self, f, row: int, up_w: np.ndarray | None) -> None:
         if not self.com_check.isChecked():
@@ -413,6 +535,9 @@ class BalanceSkeleton3DViewer(Skeleton3DViewer):
         if np.isfinite(cop).all():
             parts.append(f"<span style='color:{COP_COLOR}'>■</span> COP ML "
                          f"{cop[0] * 1000:+.0f} / AP {cop[1] * 1000:+.0f} mm")
+        cw = f.cop_world[row]
+        if np.isfinite(cw).all():
+            parts.append(f"COP world X {cw[0]:+.3f} / Y {cw[1]:+.3f} / Z {cw[2]:+.3f} m")
         cmc = f.com_minus_cop[row]
         if np.isfinite(cmc).all():
             parts.append(f"<span style='color:{COM_COLOR}'>■</span> COM−COP ML "

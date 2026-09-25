@@ -6,15 +6,28 @@ left/right asymmetry) before trusting the joint-angle numbers.
 
 With Wii Balance Board data in the project (wii/), the viewer also shows the board, the centre
 of pressure, the ground reaction force and the whole-body centre of mass, synchronized with the
-.trc playback (``BalanceSkeleton3DViewer``). Without Wii data the page is unchanged.
+.trc playback (``BalanceSkeleton3DViewer``), and the world / board coordinate frames. The
+"Wii data" menu loads a Wii file for the trial (a wii.csv or a file of the original Wii program)
+and aligns it (jumps / stomps, or the "Wii offset" box: Wii time = .trc time + offset, applied
+live so the COP can be matched to the feet by eye).
 """
 from __future__ import annotations
 
 import logging
 from pathlib import Path
 
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
-    QComboBox, QFileDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout,
+    QApplication,
+    QComboBox,
+    QDoubleSpinBox,
+    QFileDialog,
+    QHBoxLayout,
+    QLabel,
+    QMenu,
+    QMessageBox,
+    QPushButton,
+    QVBoxLayout,
 )
 
 from ..widgets.balance_3d import BalanceSkeleton3DViewer
@@ -56,6 +69,38 @@ class Viz3DPage(BasePage):
         bar.addWidget(self.file_combo, 1)
         bar.addWidget(reload_btn)
         bar.addWidget(browse_btn)
+
+        # Wii data of the trial, straight from the 3D View
+        self.wii_btn = QPushButton("Wii data")
+        self.wii_btn.setToolTip("Load a Wii Balance Board recording for this trial and align "
+                                "it with the .trc, to see the COP and the force in 3D.")
+        self.wii_menu = QMenu(self.wii_btn)
+        self.act_wii_load = self.wii_menu.addAction(
+            "Load Wii file for this trial…", self._wii_load)
+        self.act_wii_align = self.wii_menu.addAction(
+            "Auto-align (jumps / stomps on the board)", self._wii_auto_align)
+        self.act_wii_zero = self.wii_menu.addAction(
+            "Set the offset to 0 (Wii start = video start)", lambda: self._wii_set_offset(0.0))
+        self.wii_btn.setMenu(self.wii_menu)
+        self.wii_offset = QDoubleSpinBox()
+        self.wii_offset.setRange(-36000.0, 36000.0)
+        self.wii_offset.setDecimals(3)
+        self.wii_offset.setSingleStep(0.05)
+        self.wii_offset.setSuffix(" s")
+        self.wii_offset.setKeyboardTracking(False)
+        self.wii_offset.setToolTip(
+            "Wii time = .trc time + offset. Change it while watching the COP (red) under the "
+            "feet; it is saved as a manual alignment. Disabled when the Wii data was recorded "
+            "together with the videos (frame timestamps).")
+        self._offset_timer = QTimer(self)
+        self._offset_timer.setSingleShot(True)
+        self._offset_timer.setInterval(350)
+        self._offset_timer.timeout.connect(self._wii_offset_committed)
+        self.wii_offset.valueChanged.connect(lambda _v: self._offset_timer.start())
+        self.wii_offset_lbl = QLabel("Wii offset:")
+        bar.addWidget(self.wii_btn)
+        bar.addWidget(self.wii_offset_lbl)
+        bar.addWidget(self.wii_offset)
         root.addLayout(bar)
 
         self.viewer = BalanceSkeleton3DViewer()
@@ -75,9 +120,11 @@ class Viz3DPage(BasePage):
         self._balance_mtime: int | None = None  # of the .trc the viewer holds in memory
         self._balance_dirty = False
         state.balance_changed.connect(self._on_balance_changed)
+        self._update_wii_controls()
 
     def on_project_changed(self, project):
         self._refresh_list()
+        self._update_wii_controls()
 
     def _refresh_list(self):
         self.file_combo.blockSignals(True)
@@ -192,6 +239,7 @@ class Viz3DPage(BasePage):
         else:
             self.viewer.set_balance(fused, board)
         self._show_wii_status(level, text)
+        self._update_wii_controls()
 
     def _compute_balance(self, proj, path: Path):
         """``(level, status text, FusedTrial | None, BoardRegistration | None)``; level None
@@ -268,3 +316,105 @@ class Viz3DPage(BasePage):
         color = _WII_COLORS.get(level, _WII_COLORS["none"])
         self.wii_status.setText(f"<small><span style='color:{color}'>●</span> {text}</small>")
         self.wii_status.setVisible(True)
+
+    # ---- Wii data menu / offset ---------------------------------------------- #
+    def _trial(self):
+        proj = self.state.project
+        if proj is None:
+            return None
+        from poseassess.core.balance.trial import load_trial
+
+        return load_trial(proj)
+
+    def _update_wii_controls(self) -> None:
+        proj = self.state.project
+        trial = self._trial()
+        has_rec = bool(trial and trial.recording)
+        has_trc = bool(self._balance_path) and self.viewer._trc is not None
+        self.wii_btn.setEnabled(proj is not None)
+        self.act_wii_align.setEnabled(has_rec and has_trc)
+        self.act_wii_zero.setEnabled(has_rec)
+        recorded = has_rec and trial.alignment.method == "recorded"
+        self.wii_offset.setEnabled(has_rec and not recorded)
+        self.wii_offset_lbl.setEnabled(has_rec and not recorded)
+        if has_rec and not self._offset_timer.isActive():
+            self.wii_offset.blockSignals(True)
+            self.wii_offset.setValue(float(trial.alignment.offset_s))
+            self.wii_offset.blockSignals(False)
+
+    def _wii_load(self) -> None:
+        proj = self.state.project
+        if proj is None:
+            return
+        f, _ = QFileDialog.getOpenFileName(
+            self, "Load Wii file for this trial (wii.csv or a file of the original Wii program)",
+            str(proj.root.parent), "Wii data (*.csv *.txt *.dat);;All files (*)")
+        if f:
+            self.load_wii_file(f)
+
+    def load_wii_file(self, path, auto_align: bool = True) -> str | None:
+        """Import ``path`` as the trial's Wii recording, then try the automatic alignment
+        (else offset 0, to be adjusted in the "Wii offset" box). Returns the recording id."""
+        proj = self.state.project
+        if proj is None:
+            return None
+        from poseassess.core.balance.trial import import_recording
+
+        try:
+            rec_id = import_recording(proj, path)
+        except (OSError, ValueError) as e:
+            QMessageBox.warning(self, "Load Wii file", str(e))
+            return None
+        msg = None
+        if auto_align and self._balance_path:
+            msg = self._run_auto_align(quiet=True)
+        if msg is None:
+            self._wii_set_offset(0.0, notify=False)
+        self.state.notify_balance_changed("trial")  # -> _on_balance_changed redraws
+        if msg is None and auto_align and self._balance_path:
+            self.status.setText(f"Wii file loaded as {rec_id}. No jump / stomp found for an "
+                                "automatic alignment: adjust the Wii offset until the COP "
+                                "follows the feet.")
+        return rec_id
+
+    def _run_auto_align(self, quiet: bool = False) -> str | None:
+        """Automatic alignment of the trial's recording with the shown .trc; the result text,
+        or None when it failed (message box unless ``quiet``)."""
+        proj = self.state.project
+        from poseassess.core.balance.alignment import apply_alignment, auto_align
+
+        err = ""
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            res = auto_align(proj, trc_path=self._balance_path)
+        except Exception as e:  # noqa: BLE001
+            log.exception("auto-align failed")
+            res, err = None, str(e) or type(e).__name__
+        finally:
+            QApplication.restoreOverrideCursor()
+        if res is None or not res.ok:
+            if not quiet:
+                QMessageBox.information(self, "Auto-align",
+                                        err if res is None else res.message)
+            return None
+        apply_alignment(proj, res.alignment)
+        self.status.setText(res.message)
+        return res.message
+
+    def _wii_auto_align(self) -> None:
+        if self._run_auto_align() is not None:
+            self.state.notify_balance_changed("alignment")
+
+    def _wii_set_offset(self, offset: float, notify: bool = True) -> None:
+        proj = self.state.project
+        trial = self._trial()
+        if proj is None or not (trial and trial.recording):
+            return
+        from poseassess.core.balance.alignment import set_manual_offset
+
+        set_manual_offset(proj, float(offset), trc_path=self._balance_path)
+        if notify:
+            self.state.notify_balance_changed("alignment")
+
+    def _wii_offset_committed(self) -> None:
+        self._wii_set_offset(self.wii_offset.value())

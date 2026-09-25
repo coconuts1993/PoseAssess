@@ -161,3 +161,24 @@ WII RECORDING REPLAY (NO BOARD NEEDED)
     (trail 1-30 s or all), with the load / COP curves, the four sensors and
     COP sway figures. Speed 0.25x-4x; Space = play/pause, Left/Right = -/+1 s,
     Home = start. Opening a file jumps to 1 s before the subject steps on.
+
+WII DATA IN THE 3D VIEW (5. 3D View)
+------------------------------------
+  * "Wii data" > "Load Wii file for this trial..." takes a file of the
+    original Wii program or a wii.csv. The app tries to align it
+    automatically (the subject does 2 small jumps or stomps on the board).
+    If that fails, the offset is 0: change "Wii offset" (Wii time = .trc
+    time + offset) while playing, until the red COP follows the feet.
+    Each change is saved as the trial's alignment.
+  * Drawn with the skeleton: the board, the COP (red point + 2 s trail), and
+    the force as a green arrow that starts at the COP and points up. The
+    arrow is 0.5 cm per kg (35 cm for 70 kg); its label gives kg and N.
+  * "Axes" shows two coordinate frames (x red, y lime green, z blue):
+      - thick, 0.5 m, X / Y / Z, "O world": the 3D-pose world frame (origin
+        of the calibration checkerboard, Z up);
+      - thin, 0.25 m, x / y / z Wii: the board frame (board centre, x =
+        subject's right, y = front edge, z = up). COP ML / AP are in this
+        frame; the line under the view also gives the COP in world X / Y / Z.
+  * If the board is not under the subject's feet, the board position is
+    wrong (redo the clicks on 2b. Wii Board with the calibration used for
+    the .trc).

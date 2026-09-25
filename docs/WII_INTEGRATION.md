@@ -47,8 +47,12 @@ pipeline, PySide6 GUI, 3D View) and add the Wii Balance Board.
     vertical marker motion in the .trc) or by a manual offset. The alignment is stored per
     trial.
 - **R6: outputs.**
-  - 3D View: board, COP point and trail, ground-reaction-force arrow, and whole-body COM with
-    plumb line, all synchronized with the .trc playback.
+  - 3D View: board, COP point and trail, ground-reaction-force arrow (starts at the COP, length
+    proportional to the load, labelled kg / N), and whole-body COM with plumb line, all
+    synchronized with the .trc playback. "Axes": the world frame (Calib.toml origin, X / Y / Z)
+    and the board frame (board centre, x right / y front / z up). "Wii data" menu: load a Wii
+    file for the trial (auto-align, else offset 0) and a live "Wii offset" box (manual
+    alignment).
   - Results: COP sway metrics, COM-COP relation, force plots, and an export of the fused
     per-frame table.
 

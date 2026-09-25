@@ -56,9 +56,12 @@ def test_viewer_without_data_is_the_original(qapp, demo_trial):
     v = BalanceSkeleton3DViewer()
     base = Skeleton3DViewer()
     assert v.load_trc(demo_trial["trc"]) and base.load_trc(demo_trial["trc"])
-    # no GL item was added, the toggles and the read-out are hidden
+    # no balance GL item was added (only the world axes), the toggles and the read-out hidden
     assert not v._bal_items
-    assert len(v.view.items) == len(base.view.items)
+    axes = [i for i in v._axes_items.values() if i.visible()]
+    assert len(v.view.items) == len(base.view.items) + len(v._axes_items)
+    assert axes and all(v._axes_items[k] in axes for k in ("world_axes",))
+    assert not v._axes_items["board_axes"].visible()
     assert not any(c.isVisibleTo(v) for c in v._toggles)
     assert not v.balance_info.isVisibleTo(v)
     # the toggles live in the transport row, after "Cameras"
@@ -447,14 +450,20 @@ def test_render_overlays(qapp, demo_trial, monkeypatch):
     _fresh_gl_programs(monkeypatch)
     poses = read_camera_poses(demo_trial["project"].calibration_dir / "Calib.toml")
     v = BalanceSkeleton3DViewer()
-    v.resize(800, 600)
+    v.resize(1000, 600)  # the transport row with every toggle fits
     v.show()
     assert v.load_trc(demo_trial["trc"])
     v.set_cameras(poses)
     v.view.setCameraPosition(distance=3.0, elevation=20, azimuth=-60)
     v._show_frame(40)
     pump(0.3)
+    from poseassess.gui.widgets.balance_3d import AXIS_COLORS
+    with_axes = _grab(v)
+    v.axes_check.setChecked(False)  # the overlay checks below are made without the axes
+    pump(0.3)
     plain = _grab(v)
+    for col in AXIS_COLORS:
+        assert _count_color(with_axes, col, tol=40) > _count_color(plain, col, tol=40) + 20
     assert _count_color(plain, FORCE_COLOR) == 0 and _count_color(plain, COM_COLOR) == 0
     v.set_balance(fused_from_demo(demo_trial), load_board(demo_trial["project"]))
     v._show_frame(40)
@@ -496,4 +505,102 @@ def test_page_does_not_fuse_a_trc_it_is_not_showing(qapp, demo_trial):
     assert page.viewer.has_balance()
     assert page.viewer._fused.alignment.offset_s == pytest.approx(3.0)
     assert "changed on disk" not in page.wii_status.text()
+    page.close()
+
+
+# ------------------------------------------------------------------ axes, force label, Wii menu
+def test_world_and_board_axes(qapp, demo_trial):
+    from poseassess.gui.widgets.balance_3d import BOARD_AXIS_M, WORLD_AXIS_M
+
+    v, fused, board = _viewer_with_demo(demo_trial)
+    it = v._axes_items
+    assert v.axes_check.isVisibleTo(v) and v.axes_check.isChecked()
+    # world: origin of the calibration, X / Y / Z of the Calib world (Z up)
+    w = it["world_axes"].pos
+    np.testing.assert_allclose(w[0::2], np.repeat(_disp(v, [0, 0, 0]), 3, axis=0), atol=1e-9)
+    np.testing.assert_allclose(w[1::2], _disp(v, np.eye(3) * WORLD_AXIS_M), atol=1e-9)
+    # board: centre of the top surface, x right (TL->TR), y front (BL->TL), z = board up
+    b = it["board_axes"].pos
+    o, d = b[0], (b[1::2] - b[0::2]) / BOARD_AXIS_M
+    c = board.corners_world  # TL, TR, BR, BL
+    np.testing.assert_allclose(d[0], _unit(_disp_dir(v, c[1] - c[0])), atol=1e-6)
+    np.testing.assert_allclose(d[1], _unit(_disp_dir(v, c[0] - c[3])), atol=1e-6)
+    np.testing.assert_allclose(d[2], _unit(_disp_dir(v, board.up_world)), atol=1e-6)
+    assert np.linalg.norm(o - _disp(v, board.center_world)[0]) < 0.01
+    assert it["board_axes"].visible()
+    # toggle off / on; without a board only the world axes stay
+    v.axes_check.setChecked(False)
+    assert not any(i.visible() for i in it.values())
+    v.axes_check.setChecked(True)
+    v.clear_balance()
+    assert it["world_axes"].visible() and not it["board_axes"].visible()
+    v.clear()
+    assert not any(i.visible() for i in it.values()) and not v.axes_check.isVisibleTo(v)
+
+
+def _unit(x):
+    x = np.asarray(x, float)
+    return x / np.linalg.norm(x)
+
+
+def test_force_arrow_starts_at_the_cop_and_scales_with_the_load(qapp, demo_trial):
+    from poseassess.gui.widgets.balance_3d import ARROW_M_PER_KG, LIFT_M
+
+    v, fused, board = _viewer_with_demo(demo_trial)
+    lengths = []
+    for i in range(0, v._trc.n_frames, 7):
+        v._show_frame(i)
+        r = v.balance_row
+        if r < 0 or not np.isfinite(fused.total_kg[r]) or not np.isfinite(fused.cop_world[r]).all():
+            continue
+        start = v._bal_items["force"].pos[0]
+        cop = _disp(v, fused.cop_world[r])[0] + _unit(_disp_dir(v, board.up_world)) * LIFT_M
+        np.testing.assert_allclose(start, cop, atol=1e-9)
+        tip = _mesh_vertexes(v._bal_items["force_head"])[0]
+        lengths.append((fused.total_kg[r], np.linalg.norm(tip - start)))
+        if "force_label" in v._bal_items:
+            assert f"{fused.total_kg[r]:.1f} kg" in v._bal_items["force_label"].text
+    assert len(lengths) > 3
+    kg, ln = np.array(lengths).T
+    np.testing.assert_allclose(ln, kg * ARROW_M_PER_KG, rtol=1e-6)
+
+
+def test_page_loads_an_original_wii_file_and_sets_the_offset(qapp, demo_trial, monkeypatch):
+    from poseassess.core.balance.trial import load_trial
+    from poseassess.gui.pages.viz3d_page import Viz3DPage
+    from poseassess.gui.state import AppState
+    from tests.test_wii_legacy import write_legacy
+
+    proj = demo_trial["project"]
+    state = AppState()
+    page = Viz3DPage(state)
+    page.resize(1000, 700)
+    page.show()
+    state.set_project(proj)
+    pump(0.2)
+    assert page.wii_btn.isEnabled()
+    f = proj.root.parent / "S01-002.csv"
+    write_legacy(f, n=600)
+    # the automatic alignment fails (no jumps): quietly, offset 0
+    from poseassess.core.balance import alignment
+    from poseassess.core.balance.alignment import Alignment, AlignmentResult
+
+    monkeypatch.setattr(alignment, "auto_align", lambda *a, **k: AlignmentResult(
+        False, Alignment(), "no jumps", [], [], {}))
+    rec = page.load_wii_file(f)
+    pump(0.3)
+    trial = load_trial(proj)
+    assert trial.recording == rec and trial.alignment.method == "manual"
+    assert trial.alignment.offset_s == 0.0
+    assert page.wii_offset.isEnabled() and page.wii_offset.value() == 0.0
+    assert page.viewer.has_balance()
+    # the offset box is saved (debounced) as a manual alignment and redraws
+    page.wii_offset.setValue(1.25)
+    page._offset_timer.stop()
+    page._wii_offset_committed()
+    pump(0.2)
+    trial = load_trial(proj)
+    assert trial.alignment.method == "manual" and trial.alignment.offset_s == 1.25
+    assert page.viewer._fused is not None
+    np.testing.assert_allclose(page.viewer._fused.t_rel, page.viewer._fused.trc_time + 1.25)
     page.close()
