@@ -77,8 +77,14 @@ class Viz3DPage(BasePage):
         self.wii_menu = QMenu(self.wii_btn)
         self.act_wii_load = self.wii_menu.addAction(
             "Load Wii file for this trial…", self._wii_load)
+        self.found_menu = QMenu("Wii files found in this project", self.wii_menu)
+        self.wii_menu.addMenu(self.found_menu)
+        self.wii_menu.aboutToShow.connect(self._fill_found_menu)
+        self.wii_menu.addSeparator()
         self.act_wii_align = self.wii_menu.addAction(
             "Auto-align (jumps / stomps on the board)", self._wii_auto_align)
+        self.act_wii_clock = self.wii_menu.addAction(
+            "Align by the computer clock (file times, estimate)", self._wii_clock_align)
         self.act_wii_zero = self.wii_menu.addAction(
             "Set the offset to 0 (Wii start = video start)", lambda: self._wii_set_offset(0.0))
         self.wii_btn.setMenu(self.wii_menu)
@@ -248,7 +254,7 @@ class Viz3DPage(BasePage):
 
         paths = WiiPaths(proj)
         if not paths.wii_dir.is_dir():
-            return None, "", None, None
+            return self._found_status(proj)
         try:
             inside = path.resolve().parent == proj.pose3d_dir.resolve()
         except OSError:
@@ -262,7 +268,8 @@ class Viz3DPage(BasePage):
         trial = load_trial(proj)
         reg = load_board(proj)
         if reg is None and not trial.recording:
-            return "none", "Wii: no data for this trial", None, None
+            found = self._found_status(proj)
+            return found if found[0] else ("none", "Wii: no data for this trial", None, None)
         fused, err = None, ""
         if trial.recording:
             try:
@@ -288,8 +295,13 @@ class Viz3DPage(BasePage):
             except NotImplementedError:
                 pass
         else:
-            parts.append("Wii: board only, no recording for this trial (record one on "
-                         "3b. Capture or import one on 6. Results > Balance (Wii))")
+            found = self._found_files(proj)
+            if found:
+                level = "warn"
+                parts.append(f"Wii: board only. {self._found_text(proj, found)}")
+            else:
+                parts.append("Wii: board only, no recording for this trial (Wii data > Load "
+                             "Wii file for this trial…)")
         if err:
             warns.append(err)
         if fused is not None:
@@ -334,6 +346,7 @@ class Viz3DPage(BasePage):
         self.wii_btn.setEnabled(proj is not None)
         self.act_wii_align.setEnabled(has_rec and has_trc)
         self.act_wii_zero.setEnabled(has_rec)
+        self.act_wii_clock.setEnabled(has_rec)
         recorded = has_rec and trial.alignment.method == "recorded"
         self.wii_offset.setEnabled(has_rec and not recorded)
         self.wii_offset_lbl.setEnabled(has_rec and not recorded)
@@ -341,6 +354,46 @@ class Viz3DPage(BasePage):
             self.wii_offset.blockSignals(True)
             self.wii_offset.setValue(float(trial.alignment.offset_s))
             self.wii_offset.blockSignals(False)
+
+    def _found_files(self, proj) -> list:
+        from poseassess.core.balance.discover import find_wii_files
+
+        try:
+            return find_wii_files(proj)
+        except OSError:
+            return []
+
+    @staticmethod
+    def _found_text(proj, found) -> str:
+        names = []
+        for p in found[:3]:
+            try:
+                names.append(str(Path(p).relative_to(proj.root)))
+            except ValueError:
+                names.append(Path(p).name)
+        more = f" (+{len(found) - 3} more)" if len(found) > 3 else ""
+        return (f"Wii file(s) found in the project folder but not loaded: {', '.join(names)}"
+                f"{more}. Load one with Wii data > Wii files found in this project.")
+
+    def _found_status(self, proj):
+        found = self._found_files(proj)
+        if not found:
+            return None, "", None, None
+        return "warn", "Wii: " + self._found_text(proj, found), None, None
+
+    def _fill_found_menu(self) -> None:
+        self.found_menu.clear()
+        proj = self.state.project
+        found = self._found_files(proj) if proj is not None else []
+        for p in found:
+            try:
+                label = str(Path(p).relative_to(proj.root))
+            except ValueError:
+                label = str(p)
+            self.found_menu.addAction(label, lambda p=p: self.load_wii_file(p))
+        if not found:
+            self.found_menu.addAction("(none: put the Wii file in the project folder, or use "
+                                      "Load Wii file…)").setEnabled(False)
 
     def _wii_load(self) -> None:
         proj = self.state.project
@@ -368,14 +421,48 @@ class Viz3DPage(BasePage):
         msg = None
         if auto_align and self._balance_path:
             msg = self._run_auto_align(quiet=True)
+        if msg is None and auto_align:
+            msg = self._run_clock_align(quiet=True)
+            if msg is not None:
+                msg = (f"Wii file loaded as {rec_id}. No jump / stomp found: {msg} Fine-tune the "
+                       "Wii offset until the COP follows the feet.")
         if msg is None:
             self._wii_set_offset(0.0, notify=False)
+            if auto_align:
+                msg = (f"Wii file loaded as {rec_id}. No automatic alignment possible (no jump "
+                       "/ stomp, no computer time): offset 0 - adjust the Wii offset until the "
+                       "COP follows the feet.")
         self.state.notify_balance_changed("trial")  # -> _on_balance_changed redraws
-        if msg is None and auto_align and self._balance_path:
-            self.status.setText(f"Wii file loaded as {rec_id}. No jump / stomp found for an "
-                                "automatic alignment: adjust the Wii offset until the COP "
-                                "follows the feet.")
+        if msg:
+            self.status.setText(msg)
         return rec_id
+
+    def _run_clock_align(self, quiet: bool = False) -> str | None:
+        """Offset from the computer times of the Wii recording and the videos (estimate)."""
+        proj = self.state.project
+        from poseassess.core.balance.alignment import Alignment, apply_alignment
+        from poseassess.core.balance.discover import clock_offset
+        from poseassess.core.balance.paths import WiiPaths
+
+        try:
+            off, details = clock_offset(proj)
+        except (OSError, ValueError, KeyError) as e:
+            if not quiet:
+                QMessageBox.information(self, "Align by the computer clock", str(e))
+            return None
+        details["estimated_from"] = "computer clock (file times)"
+        trc = WiiPaths(proj).relative(self._balance_path) if self._balance_path else None
+        apply_alignment(proj, Alignment("manual", float(off), None, trc, details))
+        spread = details.get("video_start_spread_s") or 0.0
+        return (f"Offset {off:+.3f} s estimated from the computer clock (Wii file and video "
+                f"file times" + (f"; the cameras differ by {spread:.1f} s" if spread > 1 else "")
+                + ").")
+
+    def _wii_clock_align(self) -> None:
+        msg = self._run_clock_align()
+        if msg is not None:
+            self.status.setText(msg + " Fine-tune the Wii offset if needed.")
+            self.state.notify_balance_changed("alignment")
 
     def _run_auto_align(self, quiet: bool = False) -> str | None:
         """Automatic alignment of the trial's recording with the shown .trc; the result text,

@@ -604,3 +604,48 @@ def test_page_loads_an_original_wii_file_and_sets_the_offset(qapp, demo_trial, m
     assert page.viewer._fused is not None
     np.testing.assert_allclose(page.viewer._fused.t_rel, page.viewer._fused.trc_time + 1.25)
     page.close()
+
+
+def test_page_offers_wii_files_found_in_the_project(qapp, demo_trial, monkeypatch):
+    """A Wii file copied into a project sub-folder (e.g. 00/) is listed on the status line and
+    in the Wii data menu; loading it aligns by the computer clock when there are no jumps."""
+    import os
+
+    from poseassess.core.balance import alignment
+    from poseassess.core.balance.alignment import Alignment, AlignmentResult
+    from poseassess.core.balance.trial import load_trial, save_trial, TrialInfo
+    from poseassess.gui.pages.viz3d_page import Viz3DPage
+    from poseassess.gui.state import AppState
+    from tests.test_wii_legacy import write_legacy
+
+    proj = demo_trial["project"]
+    save_trial(proj, TrialInfo())  # the demo's recording is not linked any more
+    (proj.root / "00").mkdir()
+    f = proj.root / "00" / "a8cef4a1-003"
+    write_legacy(f, n=600)
+    state = AppState()
+    page = Viz3DPage(state)
+    page.resize(1000, 700)
+    page.show()
+    state.set_project(proj)
+    pump(0.2)
+    assert page.wii_status.isVisible()
+    assert os.path.join("00", "a8cef4a1-003") in page.wii_status.text()
+    page._fill_found_menu()
+    acts = page.found_menu.actions()
+    assert [a.text() for a in acts] == [os.path.join("00", "a8cef4a1-003")]
+
+    monkeypatch.setattr(alignment, "auto_align", lambda *a, **k: AlignmentResult(
+        False, Alignment(), "no jumps", [], [], {}))
+    from poseassess.core.balance import discover
+    monkeypatch.setattr(discover, "clock_offset", lambda p, rec_id=None: (
+        12.5, {"video_start_spread_s": 0.0}))
+    acts[0].trigger()
+    pump(0.3)
+    trial = load_trial(proj)
+    assert trial.recording == "a8cef4a1-003"
+    assert trial.alignment.method == "manual" and trial.alignment.offset_s == 12.5
+    assert trial.alignment.details["estimated_from"].startswith("computer clock")
+    assert "computer clock" in page.status.text()
+    assert page.wii_offset.value() == 12.5 and page.viewer.has_balance()
+    page.close()

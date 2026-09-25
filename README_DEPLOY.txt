@@ -164,6 +164,13 @@ WII RECORDING REPLAY (NO BOARD NEEDED)
 
 WII DATA IN THE 3D VIEW (5. 3D View)
 ------------------------------------
+  * Wii files copied anywhere into the project folder (e.g. F:\dongyang\00\)
+    are found: the line under the 3D view names them, and
+    "Wii data" > "Wii files found in this project" loads one in one click.
+    If no jump / stomp is found, the offset is estimated from the computer
+    clock (modification times of the Wii file and of the videos, ~1-2 s):
+    fine-tune it with "Wii offset". Copy the files with Explorer (keeps the
+    modification time), not by e-mail / download.
   * "Wii data" > "Load Wii file for this trial..." takes a file of the
     original Wii program or a wii.csv. The app tries to align it
     automatically (the subject does 2 small jumps or stomps on the board).
