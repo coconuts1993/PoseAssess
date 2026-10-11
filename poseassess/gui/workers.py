@@ -126,6 +126,11 @@ class PipelineWorker(QObject):
         env["PYTHONPATH"] = pkg_parent + os.pathsep + env.get("PYTHONPATH", "")
         env["PYTHONUNBUFFERED"] = "1"
         env["MPLBACKEND"] = "Agg"
+        # UTF-8 everywhere in the child (stdout pipe, default file encoding, Pose2Sim's
+        # logs): on Windows the default is the ANSI code page (cp932 on Japanese
+        # systems cannot encode e.g. the '·' in the backend names -> UnicodeEncodeError)
+        env["PYTHONUTF8"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
         # no console window on Windows
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -134,7 +139,8 @@ class PipelineWorker(QObject):
         try:
             self._proc = subprocess.Popen(
                 args, cwd=pkg_parent, env=env, stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT, text=True, bufsize=1, creationflags=flags)
+                stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
+                bufsize=1, creationflags=flags)
             for raw in self._proc.stdout:
                 line = raw.rstrip()
                 if not line:

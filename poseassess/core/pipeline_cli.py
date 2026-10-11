@@ -17,7 +17,18 @@ from __future__ import annotations
 import sys
 
 
+def _utf8_streams() -> None:
+    """Write stdout / stderr as UTF-8 whatever the Windows code page (the GUI reads this
+    process's output as UTF-8; cp932 / cp1252 cannot encode many characters)."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):  # not a text stream (e.g. None, redirected)
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _utf8_streams()
     argv = argv if argv is not None else sys.argv[1:]
     if not argv:
         print("usage: pipeline_cli <project_root> [stage,stage,...] [--continue]")
