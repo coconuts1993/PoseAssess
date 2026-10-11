@@ -36,7 +36,7 @@ class TrcData:
 
 def read_trc(path: str | Path) -> TrcData:
     path = Path(path)
-    lines = path.read_text().splitlines()
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     if len(lines) < 6:
         raise ValueError(f"{path} too short to be a TRC file")
 

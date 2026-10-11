@@ -92,3 +92,23 @@ def test_pose_stage_end_to_end_under_cp932(project, qapp):
     assert res and res[0].name == "pose"
     assert "UnicodeEncodeError" not in res[0].message, res[0].message
     assert "RTMPose-m · HALPE_26" in text
+
+
+def test_trc_and_mot_are_read_as_utf8(tmp_path):
+    """The pipeline child writes UTF-8 (PYTHONUTF8=1): the GUI must read .trc / .mot the same
+    way whatever the code page (a Japanese project path in the .trc header)."""
+    code = ("import sys; from poseassess.core.trc_io import read_trc; "
+            "from poseassess.core.assessment import mot_io; "
+            "t = read_trc(sys.argv[1]); print(t.n_frames)")
+    trc = tmp_path / "データ.trc"
+    trc.write_text("PathFileType\t4\t(X/Y/Z)\tD:\\データ\\pose-3d\\データ.trc\n"
+                   "DataRate\tCameraRate\tNumFrames\tNumMarkers\tUnits\tOrigDataRate\t"
+                   "OrigDataStartFrame\tOrigNumFrames\n"
+                   "30\t30\t2\t1\tm\t30\t0\t2\n"
+                   "Frame#\tTime\tHip\t\t\n\t\tX1\tY1\tZ1\n\n"
+                   "0\t0.0\t1\t2\t3\n1\t0.0333\t1\t2\t3\n", encoding="utf-8")
+    r = subprocess.run([sys.executable, "-X", "warn_default_encoding", "-W", "error::EncodingWarning",
+                        "-c", code, str(trc)], capture_output=True, cwd=ROOT,
+                       env=dict(os.environ, PYTHONPATH=ROOT), timeout=60)
+    assert r.returncode == 0, r.stderr.decode("utf-8", "replace")
+    assert r.stdout.decode().strip() == "2"
