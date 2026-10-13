@@ -134,7 +134,9 @@ def test_preview_record_mark_stop_and_export(page, monkeypatch):
     state.wii.connection_event.emit("wii_connected")  # the state the take started with
     state.wii.connection_event.emit("wii_disconnected")  # a change: logged as an event
     state.wii.connection_event.emit("wii_disconnected")  # repeated: not logged again
-    pump(0.8)
+    # record until there is enough data (a fixed wait is too short on a busy CI machine)
+    assert pump_until(lambda: s.recorder.counts["wii"] > 60
+                      and all(st._rec_index > 25 for st in s.streams.values()), 10.0)
     assert "● REC" in page.rec_label.text()
     folder = s.folder
     page.b_record.click()  # stop -> videos/ is empty -> exported automatically
@@ -349,7 +351,10 @@ def test_open_cameras_does_not_block_the_window(page, monkeypatch):
     release = threading.Event()
     late, opened_late = [], threading.Event()
 
+    on_gui_thread = []
+
     def slow_start(self):
+        on_gui_thread.append(threading.current_thread() is threading.main_thread())
         if self.name == "cam02" and not release.is_set():
             late.append(self)
             release.wait(10)  # a driver that hangs
@@ -364,7 +369,9 @@ def test_open_cameras_does_not_block_the_window(page, monkeypatch):
     set_file_sources(page)
     t0 = time.perf_counter()
     page.b_open.click()
-    assert time.perf_counter() - t0 < 0.3  # returned at once
+    # returned without waiting for the drivers: far below the hanging driver's 10 s (and the
+    # 1 s open timeout is not waited for either; a loaded CI machine can take ~2 s here)
+    assert time.perf_counter() - t0 < 5.0
     assert not page.b_open.isEnabled() and page.b_open.text() == "Opening cameras…"
     assert not page.b_record.isEnabled() and not page.b_snap.isEnabled()
     pump(0.2)
@@ -379,6 +386,7 @@ def test_open_cameras_does_not_block_the_window(page, monkeypatch):
     assert pump_until(lambda: opened_late.is_set() and not late[0].running
                       and late[0]._cap is None, 5.0)
     assert "cam02" not in s.streams
+    assert on_gui_thread and not any(on_gui_thread)  # no driver was opened on the GUI thread
     page.b_close.click()
     assert not s.streams
 
