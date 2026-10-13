@@ -320,6 +320,9 @@ class WiiController(QObject):
         if fatal:
             return f"Wii: off ({_short_hid_reason(fatal)})"
         st = src.status
+        if st == "searching" and getattr(src, "unresponsive", None):
+            return ("Wii: board found but not responding (switch it on / press its red SYNC "
+                    "button; close other Wii programs)")
         if st == "searching":
             return "Wii: searching for a paired board…"
         if st == "connecting":

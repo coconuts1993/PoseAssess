@@ -214,12 +214,14 @@ def test_recent_and_tare_without_data():
 
 
 # ------------------------------------------------------------------ device list
-def test_sort_boards_prefers_balance_board_and_drops_remotes():
+def test_sort_boards_prefers_balance_board_and_keeps_remotes_last():
+    """Nothing is dropped by name (on Windows a board can be named "RVL-CNT"); Wii Remotes are
+    recognised when connecting (extension type)."""
     devs = [{"path": b"a", "product_string": "Nintendo RVL-CNT-01"},
             {"path": b"b", "product_string": ""},
             {"path": b"c", "product_string": "Nintendo RVL-WBC-01"},
             {"path": b"d", "product_string": None}]
-    assert [d["path"] for d in sort_boards(devs)] == [b"c", b"b", b"d"]
+    assert [d["path"] for d in sort_boards(devs)] == [b"c", b"b", b"d", b"a"]
 
 
 def test_list_devices_filters_vendor_and_product(monkeypatch):
@@ -234,7 +236,7 @@ def test_list_devices_filters_vendor_and_product(monkeypatch):
 
     fake.enumerate = enumerate_
     monkeypatch.setitem(sys.modules, "hid", fake)
-    assert [d["path"] for d in BalanceBoardHID.list_devices()] == [PATH]
+    assert [d["path"] for d in BalanceBoardHID.list_devices()] == [PATH, b"remote", b"old-remote"]
 
 
 # ------------------------------------------------------------------ hidapi availability

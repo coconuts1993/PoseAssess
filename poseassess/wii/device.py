@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import math
+import sys
 import threading
 import time
 from collections import deque
@@ -68,10 +69,67 @@ def _path_str(path) -> str | None:
 
 
 def sort_boards(devs: list[dict]) -> list[dict]:
-    """Drop entries that are clearly Wii Remotes (same vendor/product ID as the board) and
-    list Balance Boards ("RVL-WBC") first."""
-    out = [d for d in devs if "RVL-CNT" not in (d.get("product_string") or "")]
-    return sorted(out, key=lambda d: "WBC" not in (d.get("product_string") or ""))
+    """Balance Boards ("RVL-WBC") first, devices named like Wii Remotes ("RVL-CNT") last.
+
+    Nothing is dropped by name: on Windows the product string of a paired board is not reliable
+    (a board can report "Nintendo RVL-CNT-01" like a Wii Remote, or nothing). Wii Remotes are
+    recognised when connecting instead, by the extension type (``NotABalanceBoard``), like
+    WiimoteLib does."""
+    def rank(d):
+        name = d.get("product_string") or ""
+        return 0 if "WBC" in name else 2 if "RVL-CNT" in name else 1
+    return sorted(devs, key=rank)
+
+
+class WinOutputReport:
+    """Windows: send output reports with ``HidD_SetOutputReport`` on a second handle of the
+    device (WiimoteLib's "alternate write method", Dolphin's fallback). Some Bluetooth stacks
+    reject or ignore WriteFile - hidapi's ``write`` - for Wii devices; the hidapi handle stays
+    open for reading (hidapi opens with FILE_SHARE_READ | FILE_SHARE_WRITE)."""
+
+    last_error = ""
+
+    def __init__(self, path: bytes | str):
+        import ctypes
+        from ctypes import wintypes
+
+        self._ct = ctypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        hid = ctypes.WinDLL("hid", use_last_error=True)
+        k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                    wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD,
+                                    wintypes.HANDLE]
+        k32.CreateFileW.restype = wintypes.HANDLE
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        k32.CloseHandle.restype = wintypes.BOOL
+        hid.HidD_SetOutputReport.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.ULONG]
+        hid.HidD_SetOutputReport.restype = wintypes.BOOLEAN
+        self._k32, self._hid = k32, hid
+        p = path.decode("utf-8") if isinstance(path, (bytes, bytearray)) else str(path)
+        generic_rw = 0x80000000 | 0x40000000  # GENERIC_READ | GENERIC_WRITE
+        share_rw = 0x1 | 0x2                  # FILE_SHARE_READ | FILE_SHARE_WRITE
+        h = k32.CreateFileW(p, generic_rw, share_rw, None, 3, 0, None)  # 3 = OPEN_EXISTING
+        if not h or h == ctypes.c_void_p(-1).value:  # NULL or INVALID_HANDLE_VALUE
+            err = ctypes.get_last_error()
+            raise OSError(err, f"CreateFileW failed: {ctypes.FormatError(err).strip()}")
+        self._h = h
+
+    def write(self, report: bytes) -> int:
+        """Send one output report (padded to the 22-byte report length); -1 on failure (see
+        ``last_error``)."""
+        data = P.pad(report)
+        buf = (self._ct.c_ubyte * len(data)).from_buffer_copy(data)
+        if self._hid.HidD_SetOutputReport(self._h, buf, len(data)):
+            self.last_error = ""
+            return len(data)
+        err = self._ct.get_last_error()
+        self.last_error = f"HidD_SetOutputReport failed: {self._ct.FormatError(err).strip()}"
+        return -1
+
+    def close(self) -> None:
+        h, self._h = getattr(self, "_h", None), None
+        if h:
+            self._k32.CloseHandle(h)
 
 
 @dataclass
@@ -264,6 +322,10 @@ class BalanceBoardHID(ForceSource):
 
     name = "wii-balance-board"
 
+    #: write methods tried in this order when connecting: hidapi ``write`` (WriteFile), then,
+    #: on Windows, ``HidD_SetOutputReport`` (see ``WinOutputReport``)
+    WRITE_METHODS = ("write", "set_output_report") if sys.platform == "win32" else ("write",)
+
     def __init__(self, path: bytes | None = None, silence_timeout_s: float = 5.0, **kw):
         super().__init__(**kw)
         self.path = path
@@ -271,7 +333,9 @@ class BalanceBoardHID(ForceSource):
         self.device_info: dict = {}
         self.calibration: P.Calibration | None = None
         self.battery: int | None = None
+        self.write_method: str | None = None  # the method that worked for the current board
         self._dev = None
+        self._alt = None  # WinOutputReport while write_method == "set_output_report"
 
     @staticmethod
     def list_devices() -> list[dict]:
@@ -291,12 +355,21 @@ class BalanceBoardHID(ForceSource):
 
     # ------------------------------------------------------------------ I/O
     def _write(self, report: bytes) -> None:
+        if self._alt is not None:
+            if self._alt.write(report) < 0:
+                raise BoardDisconnected(self._alt.last_error or "HidD_SetOutputReport failed")
+            return
         try:
             n = self._dev.write(list(report))
         except (OSError, ValueError) as e:
             raise BoardDisconnected(f"HID write failed: {e}") from e
         if n is None or n < 0:
-            raise BoardDisconnected("HID write failed")
+            why = ""
+            try:
+                why = self._dev.error() or ""
+            except Exception:  # noqa: BLE001
+                pass
+            raise BoardDisconnected(f"HID write failed{': ' + why if why else ''}")
 
     def _read(self, timeout_ms: int = 100) -> bytes:
         try:
@@ -349,11 +422,40 @@ class BalanceBoardHID(ForceSource):
         self._write(P.set_mode_report())
 
     # ------------------------------------------------- one connection (shared)
+    def _drain(self) -> None:
+        """Drop pending input reports (answers to an earlier attempt)."""
+        for _ in range(64):
+            if not self._read(10):
+                break
+
     def _connect(self, path: bytes, device_info: dict | None = None) -> None:
-        """Open ``path`` and initialize the board (calibration, LED, continuous reporting)."""
+        """Open ``path`` and initialize the board (calibration, LED, continuous reporting).
+
+        Tries each of ``WRITE_METHODS`` in turn, like WiimoteLib: when the board does not answer
+        (write error or no reply) with hidapi's ``write``, the initialization is repeated with
+        ``HidD_SetOutputReport`` (Windows). ``write_method`` tells which one worked."""
         self._dev = self.open_device(path)
+        errors = []
         try:
-            self._initialize()
+            for method in self.WRITE_METHODS:
+                try:
+                    if method == "set_output_report":
+                        self._alt = WinOutputReport(path)
+                        self._drain()
+                    self._initialize()
+                    self.write_method = method
+                    break
+                except BoardDisconnected as e:
+                    errors.append(f"{method}: {e}")
+                    if self._alt is not None:
+                        self._alt.close()
+                        self._alt = None
+                    if self._stop.is_set():
+                        raise
+                except OSError as e:  # the second handle could not be opened
+                    errors.append(f"{method}: {e}")
+            else:
+                raise BoardDisconnected("; ".join(errors))
         except BaseException:
             self._disconnect()
             raise
@@ -367,16 +469,22 @@ class BalanceBoardHID(ForceSource):
 
     def _disconnect(self) -> None:
         dev, self._dev = self._dev, None
-        if dev is None:
+        alt, self._alt = self._alt, None
+        if dev is None and alt is None:
             return
         try:
-            dev.write(list(P.led_report(False)))
+            if alt is not None:
+                alt.write(P.led_report(False))
+            elif dev is not None:
+                dev.write(list(P.led_report(False)))
         except Exception:  # noqa: BLE001
             pass
-        try:
-            dev.close()
-        except Exception:  # noqa: BLE001
-            pass
+        for h in (alt, dev):
+            try:
+                if h is not None:
+                    h.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _stream(self) -> None:
         """Emit samples until stop() is called; raise BoardDisconnected when the link is lost."""
@@ -431,6 +539,7 @@ class BalanceBoardHID(ForceSource):
                                      else self.device_info.get("path"))
         d["product_string"] = self.device_info.get("product_string")
         d["serial_number"] = self.device_info.get("serial_number")
+        d["write_method"] = self.write_method
         return d
 
 
@@ -466,6 +575,8 @@ class WiiAutoConnect(BalanceBoardHID):
         self.disconnects = 0  # link losses after being connected
         self.last_error: str | None = None
         self.fatal_error: str | None = None  # hidapi unusable: waiting cannot help
+        # a board is listed (paired) but does not answer: the reason, shown in the status line
+        self.unresponsive: str | None = None
         self._retry_at: dict = {}
         self._not_boards: set = set()  # device paths that are not Balance Boards
 
@@ -483,6 +594,7 @@ class WiiAutoConnect(BalanceBoardHID):
             devs = [d for d in devs if d.get("path") == self.target_path]
         devs = [d for d in devs if d.get("path") not in self._not_boards]
         if not devs:
+            self.unresponsive = None
             self._set_state("searching")
             return None
         now = time.perf_counter()
@@ -512,7 +624,8 @@ class WiiAutoConnect(BalanceBoardHID):
                 # Typical for a board that is paired but switched off: its HID entry can remain
                 # listed (Windows) while writes fail. Keep waiting quietly.
                 self.last_error = f"board not responding: {e}"
-                log.debug("%s: %s", _path_str(path), self.last_error)
+                self.unresponsive = f"{dev.get('product_string') or _path_str(path)}: {e}"
+                log.info("%s: %s", _path_str(path), self.last_error)
                 self._retry_at[path] = time.perf_counter() + self.poll_interval_s
                 self._set_state("searching")
                 self._stop.wait(self.poll_interval_s)
@@ -531,7 +644,8 @@ class WiiAutoConnect(BalanceBoardHID):
                 self._stop.wait(self.poll_interval_s)
                 continue
             self.connections += 1
-            log.info("Balance Board connected: %s", _path_str(path))
+            self.unresponsive = None
+            log.info("Balance Board connected: %s (%s)", _path_str(path), self.write_method)
             self._set_state("connected")
             try:
                 self._stream()
@@ -594,6 +708,76 @@ class SimulatedBoard(ForceSource):
             next_t += period
             if now - next_t > 0.5:  # fell far behind (machine suspended/busy): no catch-up burst
                 next_t = now + period
+
+
+def diagnose(out: Callable[[str], None] = print, listen_s: float = 1.5) -> int:
+    """Print what PoseAssess sees of the Wii devices and try to initialize each one with every
+    write method (``python -m poseassess.wii --diagnose``). Returns the number of boards that
+    delivered data. Close other Wii programs (BrainBLoX, ...) first and switch the board on."""
+    import platform
+
+    out(f"Python {platform.python_version()} on {platform.platform()}")
+    try:
+        hid = _import_hid()
+    except HidapiUnavailable as e:
+        out(f"hidapi: NOT USABLE: {e}")
+        return 0
+    out(f"hidapi module: {getattr(hid, '__file__', '?')} version {getattr(hid, '__version__', '?')}")
+    try:
+        devs = hid.enumerate(P.VENDOR_ID, 0)
+    except Exception as e:  # noqa: BLE001
+        out(f"Cannot enumerate HID devices: {e}")
+        return 0
+    out(f"Nintendo HID devices (vendor 0x{P.VENDOR_ID:04X}): {len(devs)}")
+    for i, d in enumerate(devs):
+        out(f"  [{i}] product_id=0x{d.get('product_id', 0):04X} "
+            f"product='{d.get('product_string') or ''}' "
+            f"manufacturer='{d.get('manufacturer_string') or ''}' "
+            f"serial='{d.get('serial_number') or ''}' usage_page=0x{d.get('usage_page', 0):04X} "
+            f"usage=0x{d.get('usage', 0):04X}")
+        out(f"      path={_path_str(d.get('path'))}")
+    if not devs:
+        out("No Nintendo HID device. Pair the board in Windows Bluetooth settings (press the red "
+            "SYNC button in the battery compartment; no PIN), then run this again.")
+        return 0
+    ok_boards = 0
+    for i, d in enumerate(devs):
+        if d.get("product_id") not in P.PRODUCT_IDS:
+            out(f"[{i}] skipped (product id not a Wii Remote / Balance Board)")
+            continue
+        path = d.get("path")
+        for method in BalanceBoardHID.WRITE_METHODS:
+            b = BalanceBoardHID(path=path)
+            b.WRITE_METHODS = (method,)
+            t0 = time.perf_counter()
+            try:
+                b._connect(path, d)
+            except NotABalanceBoard as e:
+                out(f"[{i}] {method}: answered, but not a Balance Board: {e}")
+                break
+            except Exception as e:  # noqa: BLE001
+                out(f"[{i}] {method}: FAILED after {time.perf_counter() - t0:.1f} s: {e}")
+                continue
+            try:
+                n, kg, end = 0, float("nan"), time.perf_counter() + listen_s
+                while time.perf_counter() < end:
+                    r = b._read(100)
+                    if r and r[0] == P.INPUT_BUTTONS_EXT8:
+                        raw = P.parse_sensor_raw(r)
+                        if raw is not None:
+                            n += 1
+                            kg = float(np.sum(b.calibration.to_kg(raw)))
+                out(f"[{i}] {method}: OK - Balance Board initialized in "
+                    f"{time.perf_counter() - t0 - listen_s:.1f} s, {n} data reports in "
+                    f"{listen_s:g} s, total {kg:.1f} kg (untared)")
+                if n:
+                    ok_boards += 1
+                    break
+                out(f"[{i}] {method}: initialized but no data reports")
+            finally:
+                b._disconnect()
+    out(f"Result: {ok_boards} board(s) delivering data.")
+    return ok_boards
 
 
 def hidapi_status() -> tuple[bool, str]:

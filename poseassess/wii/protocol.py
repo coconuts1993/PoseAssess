@@ -27,8 +27,10 @@ from dataclasses import dataclass
 import numpy as np
 
 VENDOR_ID = 0x057E
-# The Balance Board uses 0x0306 (like the original Wii Remote); 0x0330 is only the Wii Remote Plus.
-PRODUCT_IDS = (0x0306,)
+# The Balance Board uses 0x0306 (like the original Wii Remote); 0x0330 is the Wii Remote Plus.
+# Both are accepted (as by WiimoteLib): a device that is not a board is recognised when
+# connecting, by its extension type.
+PRODUCT_IDS = (0x0306, 0x0330)
 OUTPUT_REPORT_LEN = 22
 
 REPORT_LEDS = 0x11

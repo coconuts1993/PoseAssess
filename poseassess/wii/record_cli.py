@@ -8,7 +8,7 @@ Usage::
 
     python -m poseassess.wii [--project DIR | --out DIR] [--subject S] [--notes N]
                              [--seconds N] [--simulate] [--wait S] [--tare S] [--min-kg KG]
-                             [--device PATH|N] [--list]
+                             [--device PATH|N] [--list] [--diagnose]
 
 * ``--project DIR``: record into ``DIR/wii/recordings/<stamp>/`` of a PoseAssess project (it does
   NOT change the project's active trial; pick the recording on the Results page). The project's
@@ -94,6 +94,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="only use this board: its number or HID path from --list (quote the "
                          "path); default: first board found")
     ap.add_argument("--list", action="store_true", help="list detected boards and exit")
+    ap.add_argument("--diagnose", action="store_true",
+                    help="show every Nintendo HID device and try to initialize each one with "
+                         "each write method, then exit (close other Wii programs first)")
     return ap
 
 
@@ -300,6 +303,9 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.list:
         return list_boards()
+    if args.diagnose:
+        from poseassess.wii.device import diagnose
+        return EXIT_OK if diagnose() else EXIT_NO_BOARD
     try:
         dest = _destination(args)
     except ValueError as e:
