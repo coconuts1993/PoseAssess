@@ -32,6 +32,7 @@ HIDAPI_MISSING = "hidapi is not installed (pip install hidapi)"
 HID_SHADOWED = ("the installed 'hid' module is not hidapi "
                 "(pip uninstall hid; pip install --force-reinstall hidapi)")
 DEFAULT_COP_MIN_KG = 5.0  # below this total load the COP is undefined (NaN), GUI and CLI alike
+NOT_A_BOARD_RETRY_S = 60.0  # a device that answered "not a Balance Board" is skipped this long
 
 
 class BoardDisconnected(RuntimeError):
@@ -130,6 +131,103 @@ class WinOutputReport:
         h, self._h = getattr(self, "_h", None), None
         if h:
             self._k32.CloseHandle(h)
+
+
+class WinWriteFile:
+    """Windows: overlapped WriteFile with the report's REAL length (``P.real_length``) on a
+    second handle - what Dolphin does. hidapi's ``write`` pads every report to 22 bytes, which
+    the Microsoft Bluetooth stack can reject for Wii devices (e.g. the 7-byte read request).
+    Waits at most ``timeout_ms`` per report (then cancels it)."""
+
+    last_error = ""
+
+    def __init__(self, path: bytes | str, timeout_ms: int = 1000):
+        import ctypes
+        from ctypes import wintypes as W
+
+        class OVERLAPPED(ctypes.Structure):
+            _fields_ = [("Internal", ctypes.c_size_t), ("InternalHigh", ctypes.c_size_t),
+                        ("Offset", W.DWORD), ("OffsetHigh", W.DWORD), ("hEvent", W.HANDLE)]
+
+        self._ct, self._W, self._OV = ctypes, W, OVERLAPPED
+        self.timeout_ms = int(timeout_ms)
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateFileW.argtypes = [W.LPCWSTR, W.DWORD, W.DWORD, W.LPVOID, W.DWORD, W.DWORD,
+                                    W.HANDLE]
+        k32.CreateFileW.restype = W.HANDLE
+        k32.CreateEventW.argtypes = [W.LPVOID, W.BOOL, W.BOOL, W.LPCWSTR]
+        k32.CreateEventW.restype = W.HANDLE
+        k32.ResetEvent.argtypes = [W.HANDLE]
+        k32.WriteFile.argtypes = [W.HANDLE, W.LPCVOID, W.DWORD, ctypes.POINTER(W.DWORD),
+                                  ctypes.POINTER(OVERLAPPED)]
+        k32.WriteFile.restype = W.BOOL
+        k32.WaitForSingleObject.argtypes = [W.HANDLE, W.DWORD]
+        k32.WaitForSingleObject.restype = W.DWORD
+        k32.GetOverlappedResult.argtypes = [W.HANDLE, ctypes.POINTER(OVERLAPPED),
+                                            ctypes.POINTER(W.DWORD), W.BOOL]
+        k32.GetOverlappedResult.restype = W.BOOL
+        k32.CancelIo.argtypes = [W.HANDLE]
+        k32.CloseHandle.argtypes = [W.HANDLE]
+        self._k32 = k32
+        p = path.decode("utf-8") if isinstance(path, (bytes, bytearray)) else str(path)
+        h = k32.CreateFileW(p, 0x80000000 | 0x40000000, 0x1 | 0x2, None, 3,
+                            0x40000000, None)  # GENERIC_RW, SHARE_RW, OPEN_EXISTING, OVERLAPPED
+        if not h or h == ctypes.c_void_p(-1).value:
+            err = ctypes.get_last_error()
+            raise OSError(err, f"CreateFileW failed: {ctypes.FormatError(err).strip()}")
+        self._h = h
+        self._event = k32.CreateEventW(None, True, False, None)
+        if not self._event:
+            err = ctypes.get_last_error()
+            k32.CloseHandle(h)
+            self._h = None
+            raise OSError(err, f"CreateEventW failed: {ctypes.FormatError(err).strip()}")
+
+    def _fail(self, what: str) -> int:
+        err = self._ct.get_last_error()
+        self.last_error = f"{what}: {self._ct.FormatError(err).strip()}" if err else what
+        return -1
+
+    def write(self, report: bytes) -> int:
+        """Send one output report with its real length; -1 on failure / timeout."""
+        data = bytes(report)[:P.real_length(bytes(report))]
+        buf = (self._ct.c_ubyte * len(data)).from_buffer_copy(data)
+        ov = self._OV()
+        ov.hEvent = self._event
+        self._k32.ResetEvent(self._event)
+        done = self._W.DWORD(0)
+        ok = self._k32.WriteFile(self._h, buf, len(data), self._ct.byref(done),
+                                 self._ct.byref(ov))
+        if not ok:
+            if self._ct.get_last_error() != 997:  # ERROR_IO_PENDING
+                return self._fail("WriteFile failed")
+            if self._k32.WaitForSingleObject(self._event, self.timeout_ms) != 0:  # WAIT_OBJECT_0
+                self._k32.CancelIo(self._h)
+                self._k32.GetOverlappedResult(self._h, self._ct.byref(ov),
+                                              self._ct.byref(done), True)  # buffer released
+                self.last_error = f"WriteFile timed out after {self.timeout_ms} ms"
+                return -1
+        if not self._k32.GetOverlappedResult(self._h, self._ct.byref(ov), self._ct.byref(done),
+                                             False):
+            return self._fail("WriteFile failed")
+        self.last_error = ""
+        return int(done.value)
+
+    def close(self) -> None:
+        for name in ("_event", "_h"):
+            h = getattr(self, name, None)
+            setattr(self, name, None)
+            if h:
+                self._k32.CloseHandle(h)
+
+
+def _alt_writer(method: str, path: bytes):
+    """The second-handle writer for ``method`` (Windows)."""
+    if method == "writefile_exact":
+        return WinWriteFile(path)
+    if method == "set_output_report":
+        return WinOutputReport(path)
+    raise ValueError(f"unknown write method {method!r}")
 
 
 @dataclass
@@ -322,9 +420,11 @@ class BalanceBoardHID(ForceSource):
 
     name = "wii-balance-board"
 
-    #: write methods tried in this order when connecting: hidapi ``write`` (WriteFile), then,
-    #: on Windows, ``HidD_SetOutputReport`` (see ``WinOutputReport``)
-    WRITE_METHODS = ("write", "set_output_report") if sys.platform == "win32" else ("write",)
+    #: write methods tried in this order when connecting: hidapi ``write`` (WriteFile padded to
+    #: 22 bytes), then, on Windows, WriteFile with the real report length (``WinWriteFile``, as
+    #: Dolphin) and ``HidD_SetOutputReport`` (``WinOutputReport``, as WiimoteLib)
+    WRITE_METHODS = (("write", "writefile_exact", "set_output_report") if sys.platform == "win32"
+                     else ("write",))
 
     def __init__(self, path: bytes | None = None, silence_timeout_s: float = 5.0, **kw):
         super().__init__(**kw)
@@ -335,7 +435,7 @@ class BalanceBoardHID(ForceSource):
         self.battery: int | None = None
         self.write_method: str | None = None  # the method that worked for the current board
         self._dev = None
-        self._alt = None  # WinOutputReport while write_method == "set_output_report"
+        self._alt = None  # second-handle writer (WinWriteFile / WinOutputReport) or None
 
     @staticmethod
     def list_devices() -> list[dict]:
@@ -357,7 +457,7 @@ class BalanceBoardHID(ForceSource):
     def _write(self, report: bytes) -> None:
         if self._alt is not None:
             if self._alt.write(report) < 0:
-                raise BoardDisconnected(self._alt.last_error or "HidD_SetOutputReport failed")
+                raise BoardDisconnected(self._alt.last_error or f"{self.write_method} failed")
             return
         try:
             n = self._dev.write(list(report))
@@ -433,17 +533,17 @@ class BalanceBoardHID(ForceSource):
 
         Tries each of ``WRITE_METHODS`` in turn, like WiimoteLib: when the board does not answer
         (write error or no reply) with hidapi's ``write``, the initialization is repeated with
-        ``HidD_SetOutputReport`` (Windows). ``write_method`` tells which one worked."""
+        the other methods (Windows). ``write_method`` tells which one worked."""
         self._dev = self.open_device(path)
         errors = []
         try:
             for method in self.WRITE_METHODS:
                 try:
-                    if method == "set_output_report":
-                        self._alt = WinOutputReport(path)
+                    self.write_method = method
+                    if method != "write":
+                        self._alt = _alt_writer(method, path)
                         self._drain()
                     self._initialize()
-                    self.write_method = method
                     break
                 except BoardDisconnected as e:
                     errors.append(f"{method}: {e}")
@@ -455,6 +555,7 @@ class BalanceBoardHID(ForceSource):
                 except OSError as e:  # the second handle could not be opened
                     errors.append(f"{method}: {e}")
             else:
+                self.write_method = None
                 raise BoardDisconnected("; ".join(errors))
         except BaseException:
             self._disconnect()
@@ -578,7 +679,8 @@ class WiiAutoConnect(BalanceBoardHID):
         # a board is listed (paired) but does not answer: the reason, shown in the status line
         self.unresponsive: str | None = None
         self._retry_at: dict = {}
-        self._not_boards: set = set()  # device paths that are not Balance Boards
+        self._last_try: dict = {}  # path -> perf_counter of the last connection attempt
+        self._not_boards: dict = {}  # path -> until when it is skipped (not a Balance Board)
 
     def _find_board(self) -> dict | None:
         """Pick a device to try now, or None (and update the status accordingly)."""
@@ -592,14 +694,18 @@ class WiiAutoConnect(BalanceBoardHID):
             return None
         if self.target_path is not None:
             devs = [d for d in devs if d.get("path") == self.target_path]
-        devs = [d for d in devs if d.get("path") not in self._not_boards]
+        now = time.perf_counter()
+        devs = [d for d in devs if self._not_boards.get(d.get("path"), 0.0) <= now]
         if not devs:
             self.unresponsive = None
             self._set_state("searching")
             return None
-        now = time.perf_counter()
         ready = [d for d in devs if self._retry_at.get(d.get("path"), 0.0) <= now]
-        return ready[0] if ready else None
+        if not ready:
+            return None
+        # the device tried longest ago first: a dead entry listed first (a paired Wii Remote
+        # that is off, a stale duplicate of the board) must not starve the others
+        return min(ready, key=lambda d: self._last_try.get(d.get("path"), 0.0))
 
     def _run(self) -> None:
         self._retry_at = {}
@@ -615,6 +721,7 @@ class WiiAutoConnect(BalanceBoardHID):
                 self._stop.wait(self.poll_interval_s)
                 continue
             path = dev["path"]
+            self._last_try[path] = time.perf_counter()
             self._set_state("connecting")
             try:
                 self._connect(path, dev)
@@ -633,7 +740,7 @@ class WiiAutoConnect(BalanceBoardHID):
             except NotABalanceBoard as e:
                 self.last_error = f"{_path_str(path)} skipped: {e}"
                 log.warning(self.last_error)
-                self._not_boards.add(path)
+                self._not_boards[path] = time.perf_counter() + NOT_A_BOARD_RETRY_S
                 self._set_state("searching")
                 continue
             except Exception as e:  # noqa: BLE001

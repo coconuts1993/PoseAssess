@@ -368,8 +368,11 @@ class WiiController(QObject):
                          "Switch the board on (power button).")
             last = getattr(src, "last_error", None) or ""
             if last.startswith("board not responding"):
-                lines.append("A paired board is listed but does not answer: switch it on, or "
-                             "pair it again (often needed after it was switched off).")
+                lines.append("A paired board is listed but does not answer: switch it on, "
+                             "close other Wii programs (BrainBLoX...), or remove it in the "
+                             "Windows Bluetooth settings and pair it again with its red SYNC "
+                             "button (often needed after it was switched off).")
+                lines.append(f"Last error: {last}")
             elif "not a Balance Board" in last:
                 lines.append(last)
         elif st == "connecting":

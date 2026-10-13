@@ -130,6 +130,29 @@ Everything else works exactly as before.
    of pressure, force arrow, centre of mass) -> 6. Results > Balance (Wii)
    (sway metrics, plots, export).
 
+WII BOARD DOES NOT CONNECT (WINDOWS)
+------------------------------------
+  * Close every other Wii program first (BrainBLoX, Wii Fit tools...): they
+    reconfigure the board and the two programs disturb each other.
+  * Pair the board: Windows Settings > Bluetooth & devices > Add device >
+    Bluetooth, press the red SYNC button in the board's battery compartment,
+    choose "Nintendo RVL-WBC-01" (it may also be listed as
+    "Nintendo RVL-CNT-01") and leave the PIN empty (Next / Skip).
+  * A board paired this way often cannot reconnect after it was switched off:
+    remove it under Bluetooth & devices and pair it again with SYNC.
+  * Status line at the bottom of the window:
+      "Wii: connected ..."                 working
+      "Wii: searching for a paired board"  Windows lists no board: pair it
+      "Wii: board found but not responding" listed but silent: switch it on,
+                                           close other Wii programs, or
+                                           remove + pair it again
+    Page 2b. Wii Board shows the last error in full.
+  * Diagnosis: in the PoseAssess folder, type cmd in the Explorer address
+    bar and press Enter, then run:   run_wii.bat --diagnose
+    It lists every Nintendo Bluetooth device and tries three ways of talking
+    to each one (Windows Bluetooth stacks differ); send its output when
+    asking for help.
+
 WII DATA: COMPUTER TIME AND FILES OF THE ORIGINAL WII PROGRAM
 ------------------------------------------------------------
   * Every time-stamped file PoseAssess writes (wii.csv, events.csv,

@@ -28,10 +28,19 @@ import numpy as np
 
 VENDOR_ID = 0x057E
 # The Balance Board uses 0x0306 (like the original Wii Remote); 0x0330 is the Wii Remote Plus.
-# Both are accepted (as by WiimoteLib): a device that is not a board is recognised when
-# connecting, by its extension type.
+# Both are accepted (as by Dolphin / SDL; WiimoteLib takes 0x0306 only): a device that is not a
+# board is recognised when connecting, by its extension type.
 PRODUCT_IDS = (0x0306, 0x0330)
 OUTPUT_REPORT_LEN = 22
+# Real length (report id included) of the output reports we send. hidapi pads every report to
+# OUTPUT_REPORT_LEN; the Microsoft Bluetooth stack can reject such padded WriteFile calls, so the
+# Windows "writefile_exact" method sends this length (as Dolphin does).
+OUTPUT_REPORT_REAL_LEN = {0x11: 2, 0x12: 3, 0x13: 2, 0x15: 2, 0x16: 22, 0x17: 7, 0x1A: 2}
+
+
+def real_length(report: bytes) -> int:
+    """Length to send for ``report`` without padding (its own length for unknown ids)."""
+    return min(len(report), OUTPUT_REPORT_REAL_LEN.get(report[0], len(report))) if report else 0
 
 REPORT_LEDS = 0x11
 REPORT_MODE = 0x12
