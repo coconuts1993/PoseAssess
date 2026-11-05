@@ -178,9 +178,19 @@ def _exists(p: Path) -> bool:
     return p.exists() or _is_link(p)
 
 
+def _plain_path(s: str) -> str:
+    """Windows: drop the extended-length prefix os.readlink returns (\\\\?\\C:\\x -> C:\\x,
+    \\\\?\\UNC\\srv\\share -> \\\\srv\\share) so messages show the path as users type it."""
+    if s.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + s[len("\\\\?\\UNC\\"):]
+    if s.startswith("\\\\?\\"):
+        return s[len("\\\\?\\"):]
+    return s
+
+
 def _link_target(p: Path) -> str:
     try:
-        return os.readlink(p)
+        return _plain_path(os.readlink(p))
     except (OSError, ValueError):
         return "?"
 

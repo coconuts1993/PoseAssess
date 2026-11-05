@@ -720,3 +720,11 @@ def test_module_help_runs():
                        cwd=REPO, capture_output=True, text=True, timeout=60)
     assert r.returncode == 0, r.stderr
     assert "--src" in r.stdout and "--no-zip" in r.stdout and "--yes" in r.stdout
+
+
+def test_link_target_is_shown_without_the_extended_length_prefix():
+    """os.readlink on Windows returns \\\\?\\C:\\...; messages show the plain path."""
+    assert pk._plain_path("\\\\?\\C:\\openpose") == "C:\\openpose"
+    assert pk._plain_path("\\\\?\\UNC\\server\\share\\openpose") == "\\\\server\\share\\openpose"
+    assert pk._plain_path("C:\\openpose") == "C:\\openpose"
+    assert pk._plain_path("/home/x/openpose") == "/home/x/openpose"
