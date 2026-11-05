@@ -96,12 +96,15 @@ class Pipeline:
         from poseassess.plugins import base
         base.load_builtin_backends()
         opts = {
-            "openpose_dir": self.project.config.openpose_dir,
+            "openpose_dir": (self._openpose_dir() if backend == "openpose"
+                             else self.project.config.openpose_dir),
         }
         be = base.get_pose2d_backend(backend, **opts)
         avail, why = be.is_available()
         if not avail:
             raise RuntimeError(f"backend {backend!r} unavailable: {why}")
+        # every message of a throttled backend is worth logging; others: every 50th frame
+        log_all = getattr(be, "progress_throttled", False)
 
         videos = sorted(self.project.videos_dir.glob("*.mp4")) + \
             sorted(self.project.videos_dir.glob("*.avi")) + \
@@ -114,8 +117,21 @@ class Pipeline:
             self._log(f"[pose:{backend}] cam{i:02d} <- {vid.name}")
             be.process_video(
                 vid, out_dir, camera_index=i,
-                progress=lambda f, t, m: self._log(f"  {m}") if f % 50 == 0 else None,
+                progress=lambda f, t, m: self._log(f"  {m}") if log_all or f % 50 == 0 else None,
             )
+
+    def _openpose_dir(self) -> str:
+        """The local OpenPose install to run: the project setting, the folder remembered
+        on this computer or a usual place (logged); else the project setting, and the
+        backend's availability check says where it looked."""
+        from poseassess.core.openpose_setup import check_install, resolve_openpose_dir
+        root, how = resolve_openpose_dir(self.project.config.openpose_dir)
+        if root is None:
+            return self.project.config.openpose_dir
+        self._log(f"[pose:openpose] OpenPose at {root} ({how})")
+        for w in check_install(root).warnings:
+            self._log(f"[pose:openpose] warning: {w}")
+        return str(root)
 
     def _pose2sim_stage(self, name: str) -> StageResult:
         from Pose2Sim import Pose2Sim as ps

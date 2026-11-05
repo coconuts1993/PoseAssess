@@ -49,8 +49,8 @@ def main(argv: list[str] | None = None) -> int:
     except Exception:  # noqa: BLE001
         pass
 
+    from poseassess.core.pipeline import Pipeline
     from poseassess.core.project import Project
-    from poseassess.core.pipeline import Pipeline, StageResult
 
     project = Project.load(project_root)
     pipe = Pipeline(project, progress=lambda m: print(m, flush=True))
@@ -61,7 +61,9 @@ def main(argv: list[str] | None = None) -> int:
         try:
             res = getattr(pipe, name)()
         except Exception as e:  # noqa: BLE001
-            print(f"@@STAGE_RESULT {name} FAIL {type(e).__name__}: {e}", flush=True)
+            # one line: the parent reads a marker per line (e.g. OpenPose's quoted output)
+            msg = " | ".join(s for s in str(e).splitlines() if s.strip())
+            print(f"@@STAGE_RESULT {name} FAIL {type(e).__name__}: {msg}", flush=True)
             if stop_on_error:
                 break
             continue
