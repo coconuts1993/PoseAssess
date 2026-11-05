@@ -51,27 +51,54 @@ def prototxt(monkeypatch) -> bytes:
     return data
 
 
-@pytest.fixture
-def bundle(tmp_path, monkeypatch) -> Path:
-    """Fake portable PoseAssess folder; ``bundle_root()`` points at it."""
-    b = tmp_path / "share" / BUNDLE_NAME
-    files = {
-        "run.bat": b"@echo off\r\n",
-        "pack_with_openpose.bat": b"@echo off\r\n",
-        "python311/python.exe": b"MZ python",
-        "venv/pyvenv.cfg": b"home = C:\\x\\python311\n",
-        "venv/Scripts/python.exe": b"MZ venv",
-        "venv/Lib/site-packages/pkg/__init__.py": b"",
-        "venv/Lib/site-packages/pkg/__pycache__/__init__.cpython-311.pyc": b"pyc",
-        "poseassess/__init__.py": b"",
-        "poseassess/__pycache__/__init__.cpython-311.pyc": b"pyc",
-        "models/rtmlib/hub/checkpoints/rtmpose.onnx": b"onnx" * 1000,
-    }
+def write_files(root: Path, files: dict[str, bytes]) -> Path:
     for rel, data in files.items():
-        p = b / rel
+        p = root / rel
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_bytes(data)
-    (b / "recordings").mkdir()  # an empty folder is kept in the zip
+    return root
+
+
+def make_bundle(b: Path) -> Path:
+    """Minimal portable PoseAssess folder (the files `pk.BUNDLE_MARKERS` asks for)."""
+    return write_files(b, {"run.bat": b"@echo off\r\n", "python311/python.exe": b"MZ python",
+                           "venv/pyvenv.cfg": b"home = C:\\x\\python311\n"})
+
+
+#: PoseAssess's own files in the fake bundle (all of them go into the zip).
+BUNDLE_OWN = {
+    "run.bat": b"@echo off\r\n",
+    "pack_with_openpose.bat": b"@echo off\r\n",
+    "README_DEPLOY.txt": b"readme",
+    "requirements-portable.txt": b"numpy",
+    "pip_freeze.txt": b"numpy==1.26.4",
+    "python311/python.exe": b"MZ python",
+    "python311/Lib/__pycache__/os.cpython-311.pyc": b"pyc",
+    "venv/pyvenv.cfg": b"home = C:\\x\\python311\n",
+    "venv/Scripts/python.exe": b"MZ venv",
+    "venv/Lib/site-packages/pkg/__init__.py": b"",
+    "venv/Lib/site-packages/pkg/__pycache__/__init__.cpython-311.pyc": b"pyc",
+    "poseassess/__init__.py": b"",
+    "models/rtmlib/hub/checkpoints/rtmpose.onnx": b"onnx" * 1000,
+    "docs/WII_INTEGRATION.md": b"# Wii",
+}
+#: Things a lab puts into the PoseAssess folder that must not go into the zip by default.
+BUNDLE_OTHER = {
+    "poseassess/__pycache__/__init__.cpython-311.pyc": b"pyc",     # dropped like in the CI build
+    "poseassess/gui/__pycache__/app.cpython-311.pyc": b"pyc",
+    "recordings/20261101_101500_S01/session.json": b'{"subject": "S01"}',  # run_wii.bat takes
+    "recordings/20261101_101500_S01/wii.csv": b"t,fz",
+    "wheels/hidapi-0.14.0-cp311-cp311-win_amd64.whl": b"PK",
+    "subjects.txt": b"S01 Jane Doe",
+    "Trial01/videos/cam01.mp4": b"video",
+}
+
+
+@pytest.fixture
+def bundle(tmp_path, monkeypatch) -> Path:
+    """Fake portable PoseAssess folder with lab data in it; ``bundle_root()`` points at it."""
+    b = write_files(tmp_path / "share" / BUNDLE_NAME, {**BUNDLE_OWN, **BUNDLE_OTHER})
+    (b / "docs" / "img").mkdir()  # an empty folder of PoseAssess is kept in the zip
     monkeypatch.setattr(ops, "bundle_root", lambda: b)
     return b
 
@@ -116,11 +143,7 @@ def make_openpose(root: Path, prototxt: bytes, *, gpu: bool = True,
         files["bin/cudart64_110.dll"] = b"MZ cudart"
     if caffemodel:
         files["models/pose/body_25b/pose_iter_XXXXXX.caffemodel"] = b"body25b weights" * 1000
-    for rel, data in files.items():
-        p = root / rel
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_bytes(data)
-    return root
+    return write_files(root, files)
 
 
 SLIM = {
@@ -219,11 +242,14 @@ def test_zip_contains_the_bundle_folder_with_openpose(tmp_path, bundle, prototxt
         assert top in names and all(n.startswith(top) for n in names)
         for rel in SLIM:
             assert f"{top}openpose/{rel}" in names
-        for rel in ("run.bat", "venv/pyvenv.cfg", "venv/Scripts/python.exe", "python311/python.exe",
-                    "poseassess/__init__.py", "models/rtmlib/hub/checkpoints/rtmpose.onnx"):
+        for rel in BUNDLE_OWN:  # PoseAssess's own files, with the bytecode of venv / python311
             assert top + rel in names
-        assert f"{top}recordings/" in names
-        assert not any("__pycache__" in n or n.endswith(".pyc") for n in names)
+        assert f"{top}docs/img/" in names
+        # left out: lab data (participant recordings, projects, ...) and the app's own caches
+        assert {n for n in names if not n.endswith("/")} == (
+            {top + rel for rel in BUNDLE_OWN} | {f"{top}openpose/{rel}" for rel in SLIM})
+        assert not any(n.startswith(f"{top}recordings") or "S01" in n for n in names)
+        assert not any(n.startswith(f"{top}poseassess/") and "__pycache__" in n for n in names)
         assert not any("pose_iter_440000" in n or "pose_iter_584000" in n for n in names)
         assert not any("/models/face/" in n or "/models/hand/" in n for n in names)
         weights = zf.getinfo(f"{top}openpose/models/pose/body_25b/pose_iter_XXXXXX.caffemodel")
@@ -232,21 +258,84 @@ def test_zip_contains_the_bundle_folder_with_openpose(tmp_path, bundle, prototxt
         assert zf.read(weights) == (src / "models/pose/body_25b/pose_iter_XXXXXX.caffemodel"
                                     ).read_bytes()
     out = capsys.readouterr().out
+    left_out = out.split("Left out of the zip")[1].split("Zipping")[0]
+    for name in ("recordings", "wheels", "subjects.txt", "Trial01"):
+        assert f"  {name}" in left_out
+    assert "--include" in left_out and "venv" not in left_out
     assert str(zp) in out
     assert pk.SHARED_DRIVE_SENTENCE in out
     assert pk.SHARED_DRIVE_SENTENCE == ("Put this zip on the lab's shared drive; do not upload it "
                                         "(OpenPose license).")
 
 
+def test_include_adds_left_out_entries(tmp_path, bundle, prototxt, capsys):
+    src = make_openpose(tmp_path / "C" / "openpose", prototxt)
+    assert pk.main(["--src", str(src), "--yes", "--include", "recordings",
+                    "--include", "subjects.txt"]) == 0
+    with zipfile.ZipFile(zip_path_of(bundle)) as zf:
+        names = set(zf.namelist())
+    top = f"{BUNDLE_NAME}/"
+    assert {f"{top}recordings/20261101_101500_S01/session.json", f"{top}subjects.txt"} <= names
+    assert not any("wheels" in n or "Trial01" in n for n in names)
+    left_out = capsys.readouterr().out.split("Left out of the zip")[1].split("Zipping")[0]
+    assert "  recordings" not in left_out and "  wheels" in left_out
+
+
+def test_include_of_a_missing_entry_is_refused(tmp_path, bundle, prototxt, capsys):
+    src = make_openpose(tmp_path / "C" / "openpose", prototxt)
+    assert pk.main(["--src", str(src), "--yes", "--include", "recordngs"]) == pk.EXIT_USAGE
+    assert not (bundle / "openpose").exists() and not zip_path_of(bundle).exists()
+    assert "recordngs" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("argv", [["--bogus"], ["--no-zip", "--zip-path", "x.zip"],
+                                  ["--include", "recordings/S01"], ["--include", ".."],
+                                  ["--include", "recordings", "--no-zip"]])
+def test_usage_errors_exit_64_not_2(bundle, argv):
+    with pytest.raises(SystemExit) as e:
+        pk.main(argv, ask=no_questions)
+    assert e.value.code == pk.EXIT_USAGE == 64 != pk.EXIT_NOT_READY
+    assert not (bundle / "openpose").exists()
+
+
 def test_zip_path_option_file_and_folder(tmp_path, bundle, prototxt):
     src = make_openpose(tmp_path / "C" / "openpose", prototxt)
-    target = tmp_path / "out" / "lab.zip"
+    name = f"{BUNDLE_NAME}_with_OpenPose.zip"
+    target = tmp_path / "out" / "lab.ZIP"
     assert pk.main(["--src", str(src), "--yes", "--zip-path", str(target)]) == 0
     assert target.is_file() and not zip_path_of(bundle).exists()
     folder = tmp_path / "outdir"
     folder.mkdir()
     assert pk.main(["--src", str(src), "--yes", "--zip-path", str(folder)]) == 0
-    assert (folder / f"{BUNDLE_NAME}_with_OpenPose.zip").is_file()
+    assert (folder / name).is_file()
+    # a new folder: given with a trailing separator, or a name without .zip
+    for arg, made in ((str(tmp_path / "share_new") + os.sep, tmp_path / "share_new"),
+                      (f'"{tmp_path / "lab_drive" / "PoseAssess"}"',
+                       tmp_path / "lab_drive" / "PoseAssess")):
+        assert pk.main(["--src", str(src), "--yes", "--zip-path", arg]) == 0
+        assert made.is_dir() and zipfile.is_zipfile(made / name)
+
+
+def test_existing_zip_is_replaced_only_after_yes(tmp_path, bundle, prototxt):
+    src = make_openpose(tmp_path / "C" / "openpose", prototxt)
+    target = tmp_path / "lab.zip"
+    target.write_bytes(b"keep me")
+    ask = answers("", "")  # Enter on the replace question means No
+    assert pk.main(["--src", str(src), "--zip-path", str(target)], ask=ask) == pk.EXIT_CANCELLED
+    assert "Replace" in ask.prompts[1] and str(target) in ask.prompts[1]
+    assert target.read_bytes() == b"keep me" and not (bundle / "openpose").exists()
+
+    assert pk.main(["--src", str(src), "--zip-path", str(target)], ask=answers("y", "y")) == 0
+    assert zipfile.is_zipfile(target)
+
+
+def test_zip_path_below_a_file_is_refused_before_copying(tmp_path, bundle, prototxt, capsys):
+    src = make_openpose(tmp_path / "C" / "openpose", prototxt)
+    (tmp_path / "afile").write_bytes(b"x")
+    rc = pk.main(["--src", str(src), "--yes", "--zip-path", str(tmp_path / "afile" / "o.zip")])
+    assert rc == pk.EXIT_FAILED
+    assert not (bundle / "openpose").exists()
+    assert "not a folder" in capsys.readouterr().out
 
 
 def test_zip_inside_the_bundle_is_refused(tmp_path, bundle, prototxt):
@@ -254,12 +343,6 @@ def test_zip_inside_the_bundle_is_refused(tmp_path, bundle, prototxt):
     rc = pk.main(["--src", str(src), "--yes", "--zip-path", str(bundle / "x.zip")])
     assert rc == pk.EXIT_FAILED == 3
     assert not (bundle / "openpose").exists() and not (bundle / "x.zip").exists()
-
-
-def test_no_zip_and_zip_path_are_exclusive(bundle):
-    with pytest.raises(SystemExit) as e:
-        pk.main(["--no-zip", "--zip-path", "x.zip"])
-    assert e.value.code == 2
 
 
 def test_zip_failure_leaves_no_part_file(tmp_path, bundle, prototxt, monkeypatch, capsys):
@@ -334,17 +417,31 @@ def test_no_openpose_anywhere(bundle, capsys):
     assert pk.main(["--yes"]) == pk.EXIT_NOT_READY
     out = capsys.readouterr().out
     assert "OpenPose not found" in out and "--src" in out
+    assert "1. Project > Get OpenPose..." in out
+
+
+def test_development_checkout_is_refused(tmp_path, prototxt, monkeypatch, capsys):
+    """A clone also has run.bat, but no python311 / venv: nothing is copied or zipped."""
+    src = make_openpose(tmp_path / "C" / "openpose", prototxt)
+    repo = write_files(tmp_path / "poseassess-repo", {
+        "run.bat": b"@echo off\r\n", "poseassess/__init__.py": b"", "tests/test_x.py": b""})
+    monkeypatch.setattr(ops, "bundle_root", lambda: repo)
+    assert pk.main(["--src", str(src), "--yes"], ask=no_questions) == pk.EXIT_FAILED
+    assert not (repo / "openpose").exists()
+    assert list(tmp_path.glob("*.zip")) == []
+    out = capsys.readouterr().out
+    assert "not the portable PoseAssess folder" in out and "python311" in out
 
 
 def test_refuses_destination_inside_or_equal_to_source(tmp_path, prototxt, monkeypatch, capsys):
     src = make_openpose(tmp_path / "openpose", prototxt)
-    inner = src / BUNDLE_NAME
-    inner.mkdir()
+    inner = make_bundle(src / BUNDLE_NAME)
     monkeypatch.setattr(ops, "bundle_root", lambda: inner)
     assert pk.main(["--src", str(src), "--yes"]) == pk.EXIT_FAILED
     assert not (inner / "openpose").exists()
     assert "inside" in capsys.readouterr().out
 
+    make_bundle(tmp_path)
     monkeypatch.setattr(ops, "bundle_root", lambda: tmp_path)  # destination = the source
     before = rel_files(src)
     assert pk.main(["--src", str(src / "bin"), "--yes"]) == pk.EXIT_FAILED
@@ -352,7 +449,7 @@ def test_refuses_destination_inside_or_equal_to_source(tmp_path, prototxt, monke
 
 
 def test_source_inside_the_bundle_is_not_zipped(bundle, prototxt, capsys):
-    src = make_openpose(bundle / "tools" / "openpose", prototxt)
+    src = make_openpose(bundle / "models" / "openpose", prototxt)  # models goes into the zip
     assert pk.main(["--src", str(src), "--yes"]) == pk.EXIT_FAILED
     assert not (bundle / "openpose").exists() and not zip_path_of(bundle).exists()
     assert "--no-zip" in capsys.readouterr().out
@@ -360,16 +457,31 @@ def test_source_inside_the_bundle_is_not_zipped(bundle, prototxt, capsys):
     assert rel_files(bundle / "openpose") == SLIM
 
 
+def test_source_in_a_left_out_folder_of_the_bundle(bundle, prototxt):
+    src = make_openpose(bundle / "tools" / "openpose", prototxt)
+    assert pk.main(["--src", str(src), "--yes"]) == 0
+    with zipfile.ZipFile(zip_path_of(bundle)) as zf:
+        assert not any("/tools/" in n for n in zf.namelist())
+    assert pk.main(["--src", str(src), "--yes", "--include", "tools"]) == pk.EXIT_FAILED
+
+
 @pytest.mark.skipif(not hasattr(os, "symlink"), reason="no symlinks")
-def test_refuses_destination_linked_to_the_source(tmp_path, bundle, prototxt):
+@pytest.mark.parametrize("given", [True, False])
+def test_destination_linked_to_the_source_is_explained(tmp_path, bundle, prototxt, monkeypatch,
+                                                       capsys, given):
     src = make_openpose(tmp_path / "C" / "openpose", prototxt)
+    link = bundle / "openpose"
     try:
-        os.symlink(src, bundle / "openpose", target_is_directory=True)
+        os.symlink(src, link, target_is_directory=True)
     except OSError:
         pytest.skip("cannot create symlinks here")
+    monkeypatch.setattr(ops, "candidate_dirs", lambda: [link, src])
     before = rel_files(src)
-    assert pk.main(["--src", str(src), "--yes"]) == pk.EXIT_FAILED
-    assert rel_files(src) == before
+    argv = ["--src", str(src), "--yes"] if given else ["--yes"]
+    assert pk.main(argv, ask=no_questions) == pk.EXIT_FAILED
+    assert rel_files(src) == before and link.is_symlink()
+    out = capsys.readouterr().out
+    assert f"{link} is a link to {src}" in out and "rmdir" in out
 
 
 # --------------------------------------------------------------------------- #
@@ -475,14 +587,31 @@ def test_ctrl_c_during_copy_leaves_nothing(tmp_path, bundle, prototxt, monkeypat
 
 
 def test_leftovers_of_an_interrupted_run_are_removed(tmp_path, bundle, prototxt):
+    """A complete swap whose clean-up was interrupted: .openpose.old is a stale copy."""
     src = make_openpose(tmp_path / "C" / "openpose", prototxt)
+    _old_copy(bundle)
     for name in (pk.NEW_DIR, pk.OLD_DIR):
         (bundle / name / "bin").mkdir(parents=True)
         (bundle / name / "bin" / "half.dll").write_bytes(b"x")
     assert pk.main(["--src", str(src), "--yes"]) == 0
     assert not (bundle / pk.NEW_DIR).exists() and not (bundle / pk.OLD_DIR).exists()
+    assert rel_files(bundle / "openpose") == SLIM
     with zipfile.ZipFile(zip_path_of(bundle)) as zf:
         assert not any(".openpose." in n for n in zf.namelist())
+
+
+def test_stranded_old_copy_is_put_back_not_deleted(tmp_path, bundle, prototxt, capsys):
+    """Interrupted between the two renames: the previous copy is only in .openpose.old."""
+    src = make_openpose(tmp_path / "C" / "openpose", prototxt)
+    (bundle / pk.OLD_DIR / "bin").mkdir(parents=True)
+    (bundle / pk.OLD_DIR / "bin" / "previous.dll").write_bytes(b"old")
+    (bundle / pk.NEW_DIR).mkdir()
+    ask = answers("", "n")  # license: Enter; replace the (restored) openpose folder: no
+    assert pk.main(["--src", str(src), "--no-zip"], ask=ask) == pk.EXIT_CANCELLED
+    assert "Replace" in ask.prompts[1]
+    assert rel_files(bundle / "openpose") == {"bin/previous.dll"}
+    assert not (bundle / pk.OLD_DIR).exists() and not (bundle / pk.NEW_DIR).exists()
+    assert "Put back the previous OpenPose copy" in capsys.readouterr().out
 
 
 def test_rename_is_retried_and_failure_restores_the_old_copy(tmp_path, bundle, prototxt,
@@ -513,6 +642,55 @@ def test_rename_is_retried_and_failure_restores_the_old_copy(tmp_path, bundle, p
     assert not (bundle / pk.NEW_DIR).exists() and not (bundle / pk.OLD_DIR).exists()
 
 
+def _installed_with_marker(tmp_path, bundle, prototxt) -> Path:
+    src = make_openpose(tmp_path / "C" / "openpose", prototxt)
+    assert pk.main(["--src", str(src), "--yes", "--no-zip"]) == 0
+    (bundle / "openpose" / "bin" / "marker.dll").write_bytes(b"old")
+    return src
+
+
+def test_ctrl_c_between_the_renames_puts_the_old_copy_back(tmp_path, bundle, prototxt,
+                                                           monkeypatch):
+    src = _installed_with_marker(tmp_path, bundle, prototxt)
+    real = os.rename
+
+    def ctrl_c_on_new(a, b):  # e.g. pressed while the rename of the new copy is retried
+        if Path(a).name == pk.NEW_DIR:
+            raise KeyboardInterrupt
+        return real(a, b)
+    monkeypatch.setattr(os, "rename", ctrl_c_on_new)
+    assert pk.main(["--src", str(src), "--yes", "--no-zip"]) == pk.EXIT_CANCELLED
+    assert (bundle / "openpose" / "bin" / "marker.dll").is_file()
+    assert ops.check_install(bundle / "openpose").ok
+    assert not (bundle / pk.NEW_DIR).exists() and not (bundle / pk.OLD_DIR).exists()
+
+
+@pytest.mark.parametrize("exc", [PermissionError(13, "in use"), KeyboardInterrupt()])
+def test_failed_put_back_says_where_the_old_copy_is(tmp_path, bundle, prototxt, monkeypatch,
+                                                    capsys, exc):
+    src = _installed_with_marker(tmp_path, bundle, prototxt)
+    real = os.rename
+    old = bundle / pk.OLD_DIR
+
+    def stuck(a, b):  # the new copy cannot be renamed, and the old one not back either
+        if Path(a).name == pk.NEW_DIR:
+            raise exc
+        if Path(a).name == pk.OLD_DIR:
+            raise PermissionError(13, "in use")
+        return real(a, b)
+    monkeypatch.setattr(os, "rename", stuck)
+    capsys.readouterr()
+    rc = pk.main(["--src", str(src), "--yes", "--no-zip"])
+    assert rc == (pk.EXIT_CANCELLED if isinstance(exc, KeyboardInterrupt) else pk.EXIT_FAILED)
+    assert not (bundle / "openpose").exists() and (old / "bin" / "marker.dll").is_file()
+    assert str(old) in capsys.readouterr().out
+
+    # the next run puts it back instead of deleting it as a leftover
+    monkeypatch.setattr(os, "rename", real)
+    assert pk.main(["--src", str(src), "--no-zip"], ask=answers("", "n")) == pk.EXIT_CANCELLED
+    assert (bundle / "openpose" / "bin" / "marker.dll").is_file() and not old.exists()
+
+
 # --------------------------------------------------------------------------- #
 # launcher
 # --------------------------------------------------------------------------- #
@@ -523,7 +701,7 @@ def test_bat_has_crlf_and_runs_the_module():
     assert data.endswith(b"\r\n")
     text = data.decode("ascii")
     assert '"%ROOT%\\venv\\Scripts\\python.exe" -m poseassess.tools.pack_openpose %*' in text
-    for line in ('set "PYTHONPATH=%ROOT%"', 'set "PYTHONUTF8=1"',
+    for line in ('set "PYTHONPATH=%ROOT%"', 'set "PYTHONUTF8=1"', 'set "PYTHONSAFEPATH=1"',
                  '> "%ROOT%\\venv\\pyvenv.cfg" echo home = %PYHOME%',
                  '>> "%ROOT%\\venv\\pyvenv.cfg" echo executable = %PYHOME%\\python.exe'):
         assert line in text

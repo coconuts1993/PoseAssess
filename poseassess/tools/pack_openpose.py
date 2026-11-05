@@ -13,14 +13,23 @@ Run from the portable PoseAssess folder (``pack_with_openpose.bat`` does this)::
    CMU's license / readme / third-party notice files. The copy goes to a temporary sibling folder
    that is renamed at the end, so a failed copy never leaves a half-copied ``openpose`` folder;
    an existing ``openpose`` folder is replaced only after confirmation.
-4. Unless ``--no-zip``: zips the whole PoseAssess folder (without ``__pycache__``) to
-   ``<parent>/<folder>_with_OpenPose.zip`` for the lab's shared drive.
+4. Unless ``--no-zip``: zips PoseAssess's own files (``python311``, ``venv``, ``poseassess``,
+   ``models``, ``openpose``, ``docs``, the launchers and the readme / requirement lists; see
+   `BUNDLE_DIRS`, `BUNDLE_FILE_PATTERNS`) to ``<parent>/<folder>_with_OpenPose.zip`` for the
+   lab's shared drive. Anything else in the folder (e.g. ``recordings`` of ``run_wii.bat``, i.e.
+   participant data) is left out and listed; ``--include NAME`` adds such an entry. Only the app
+   source drops its ``__pycache__`` (as the public build does); the compiled bytecode of
+   ``venv`` and ``python311`` is kept. ``--zip-path`` takes a file (``*.zip``) or a folder.
 
-OpenPose (CMU) is licensed for non-commercial use only and must not be redistributed: the
-package is for internal use at one site of the licensee's organisation. Do not upload it.
+Only the portable PoseAssess folder is packed (it needs ``run.bat``, ``python311\\python.exe``
+and ``venv\\pyvenv.cfg``); a development checkout is refused.
 
-Exit codes: 0 done, 2 OpenPose not found / not ready, 3 copy or zip failed (also a destination
-that cannot be used), 130 cancelled.
+OpenPose (CMU) may be used only for noncommercial internal research purposes and must not be
+redistributed: the package is a copy for internal noncommercial use at a single site of the
+licensee's organization, with CMU's notices kept. Do not upload it.
+
+Exit codes: 0 done, 2 OpenPose not found / not ready, 3 copy or zip failed (also a folder or
+destination that cannot be used), 64 wrong command-line options, 130 cancelled.
 """
 
 from __future__ import annotations
@@ -36,11 +45,11 @@ import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 
 from poseassess.core import openpose_setup as ops
 
-EXIT_OK, EXIT_NOT_READY, EXIT_FAILED, EXIT_CANCELLED = 0, 2, 3, 130
+EXIT_OK, EXIT_NOT_READY, EXIT_FAILED, EXIT_USAGE, EXIT_CANCELLED = 0, 2, 3, 64, 130
 
 DEST_NAME = "openpose"
 NEW_DIR = ".openpose.new"    # temporary sibling of <bundle>/openpose while copying
@@ -54,9 +63,19 @@ NOTICE_PATTERNS = ("license*", "licence*", "copying*", "notice*", "readme*", "*.
 #: Root folders with third-party code: only their license / version notes are kept.
 THIRD_PARTY_DIRS = frozenset({"3rdparty", "3rd_party", "third_party", "thirdparty"})
 THIRD_PARTY_NOTICE_PATTERNS = ("license*", "licence*", "copying*", "notice*", "version*")
-#: Directory names never put into the zip.
-ZIP_EXCLUDE_DIRS = frozenset({"__pycache__", ".git", ".pytest_cache", ".ruff_cache",
-                              ".mypy_cache", NEW_DIR, OLD_DIR})
+#: Files that make a folder the portable PoseAssess folder (a development checkout lacks some).
+BUNDLE_MARKERS = (Path("run.bat"), Path("python311", "python.exe"), Path("venv", "pyvenv.cfg"))
+#: Top-level folders / files of the portable PoseAssess folder that go into the zip
+#: (case-insensitive); everything else (recordings, projects, wheels, ...) is left out.
+BUNDLE_DIRS = frozenset({"python311", "venv", "poseassess", "models", "docs", DEST_NAME})
+BUNDLE_FILE_PATTERNS = ("*.bat", "readme*", "license*", "requirements*.txt", "pip_freeze.txt",
+                        "models_list.txt")
+#: Directory names never put into the zip (at any depth).
+ZIP_EXCLUDE_DIRS = frozenset({".git", ".pytest_cache", ".ruff_cache", ".mypy_cache"})
+#: Top-level folders whose ``__pycache__`` is dropped: only the app source, as the public build
+#: does. The bytecode pip / Python compiled in venv and python311 is kept, so the first start on
+#: each PC (or every start from a read-only share) does not recompile the whole stack.
+PYCACHE_FREE_DIRS = frozenset({"poseassess"})
 #: Stored without compression (weights and archives hardly compress; deflating them is slow).
 STORED_SUFFIXES = frozenset({".caffemodel", ".onnx", ".pth", ".pt", ".zip", ".7z", ".gz",
                              ".bz2", ".xz", ".whl", ".mp4", ".avi", ".mkv", ".png", ".jpg"})
@@ -66,11 +85,14 @@ _PROGRESS_INTERVAL_S = 0.25
 _RENAME_ATTEMPTS = 10        # a virus scanner reading a just-copied exe blocks renames briefly
 _RENAME_DELAY_S = 0.5
 
+GUI_HINT = "in PoseAssess: 1. Project > Get OpenPose..."
+
 LICENSE_NOTE = f"""\
-OpenPose license (CMU): OpenPose may be used for non-commercial research and teaching only, and it
-must not be passed on. The package made here is for INTERNAL non-commercial use at a single site
-of the licensee's organization (the lab whose members accepted the OpenPose license). Keep it on
-the lab's shared drive: do not upload, publish or give it to anyone outside the lab.
+OpenPose license (CMU): OpenPose may be used only for noncommercial internal research purposes.
+The package made here is a copy for internal noncommercial use at a single site of the
+licensee's organization (the lab whose members accepted the OpenPose license). CMU's copyright
+and license notices are copied with it and must stay with it. Keep it on the lab's shared drive:
+do not upload, publish or give it to anyone outside the lab.
 License: {ops.LICENSE_URL}"""
 
 
@@ -151,6 +173,18 @@ def _is_link(p: Path) -> bool:
         junction is not None and getattr(st, "st_reparse_tag", None) == junction)
 
 
+def _exists(p: Path) -> bool:
+    """True for an existing file / folder and for a link (also a broken one)."""
+    return p.exists() or _is_link(p)
+
+
+def _link_target(p: Path) -> str:
+    try:
+        return os.readlink(p)
+    except (OSError, ValueError):
+        return "?"
+
+
 def _remove(p: Path) -> bool:
     """Delete a file / folder / link; True when it is gone."""
     with contextlib.suppress(OSError):
@@ -163,7 +197,7 @@ def _remove(p: Path) -> bool:
             shutil.rmtree(p, ignore_errors=True)
         elif p.exists():
             p.unlink()
-    return not (p.exists() or _is_link(p))
+    return not _exists(p)
 
 
 def _rename(src: Path, dst: Path) -> None:
@@ -279,38 +313,87 @@ def _copy_files(plan: list[CopyItem], target: Path) -> None:
     progress.finish(done, f"{len(plan)}/{len(plan)} files, ")
 
 
-def _swap_in(new: Path, dest: Path) -> None:
-    """Rename `new` to `dest`, replacing an existing `dest` (put back when the rename fails)."""
-    old = dest.with_name(OLD_DIR)
-    had_old = dest.exists() or _is_link(dest)
-    if had_old:
-        try:
-            _rename(dest, old)
-        except OSError as e:
-            raise PackError(f"cannot replace {dest} (is OpenPose or PoseAssess running from it? "
-                            f"close it and try again): {e}") from e
+def _put_back(old: Path, dest: Path) -> str:
+    """Rename the previous copy `old` back to `dest` when `dest` is gone.
+
+    Returns "" when nothing is left to do, else a note that says where the previous copy is.
+    """
+    if _exists(dest) or not _exists(old):
+        return ""
     try:
-        _rename(new, dest)
+        _rename(old, dest)
+        return ""
     except OSError as e:
+        return (f". The previous OpenPose copy is in {old} (putting it back failed: {e}); "
+                f"rename it back to {dest.name}, or run this tool again")
+
+
+def _swap_in(new: Path, dest: Path) -> None:
+    """Rename `new` to `dest`, replacing an existing `dest`.
+
+    An existing `dest` is first renamed to ``.openpose.old``. If a rename error or Ctrl+C stops
+    the swap before `new` is in place, the previous copy is put back; should even that fail, the
+    error names ``.openpose.old``. In that case, and when the process is killed (closed console
+    window, power cut), the next run puts it back (`recover_interrupted`).
+    """
+    old = dest.with_name(OLD_DIR)
+    had_old = _exists(dest)
+    try:
         if had_old:
-            with contextlib.suppress(OSError):
-                _rename(old, dest)
-        raise PackError(f"cannot rename {new.name} to {dest}: {e}") from e
+            try:
+                _rename(dest, old)
+            except OSError as e:
+                raise PackError(f"cannot replace {dest} (is OpenPose or PoseAssess running from "
+                                f"it? close it and try again): {e}") from e
+        _rename(new, dest)
+    except BaseException as e:
+        note = _put_back(old, dest) if had_old else ""
+        if isinstance(e, OSError):
+            raise PackError(f"cannot rename {new.name} to {dest}: {e}{note}") from e
+        if isinstance(e, PackError) and note:
+            raise PackError(f"{e}{note}") from e
+        raise
     if had_old and not _remove(old):
         _say(f"  Note: could not delete all of the old copy {old}; delete it by hand.")
+
+
+def recover_interrupted(dest: Path) -> None:
+    """Clean up after an interrupted earlier run (Ctrl+C, closed window, power cut).
+
+    A half-made ``.openpose.new`` is deleted. A ``.openpose.old`` is the previous copy that was
+    moved away just before the swap: it is put back as `dest` when `dest` is missing, and
+    deleted only when `dest` is in place (the swap was complete). Raises PackError when that
+    cannot be done.
+    """
+    new, old = dest.with_name(NEW_DIR), dest.with_name(OLD_DIR)
+    if _exists(new) and not _remove(new):
+        raise PackError(f"cannot delete the leftover folder {new}; delete it by hand")
+    if not _exists(old):
+        return
+    if _exists(dest):
+        if not _remove(old):
+            raise PackError(f"cannot delete the leftover folder {old} (an old OpenPose copy); "
+                            "delete it by hand")
+        return
+    try:
+        _rename(old, dest)
+    except OSError as e:
+        raise PackError(f"cannot put the previous OpenPose copy {old} back as {dest}: {e}; "
+                        f"rename it to {dest.name} by hand") from e
+    _say(f"Put back the previous OpenPose copy that an interrupted run had left in {old.name}: "
+         f"{dest}")
 
 
 def copy_slim(plan: list[CopyItem], dest: Path) -> ops.InstallStatus:
     """Copy `plan` into ``<dest parent>/.openpose.new``, check it, then rename it to `dest`.
 
-    Nothing is left behind on failure (PackError) or Ctrl+C; an existing `dest` is kept unless
-    the new copy is complete.
+    A failed or cancelled copy leaves no ``.openpose.new`` behind, and an existing `dest` is
+    replaced only by a complete, checked copy (see `_swap_in`; if even putting the previous
+    copy back fails, the error says where it is).
     """
     new = dest.with_name(NEW_DIR)
     total = sum(i.size for i in plan)
-    for stale in (new, dest.with_name(OLD_DIR)):  # left over by an interrupted earlier run
-        if (stale.exists() or _is_link(stale)) and not _remove(stale):
-            raise PackError(f"cannot delete the leftover folder {stale}; delete it by hand")
+    recover_interrupted(dest)
     try:
         free = shutil.disk_usage(dest.parent).free
     except OSError as e:
@@ -328,7 +411,7 @@ def copy_slim(plan: list[CopyItem], dest: Path) -> ops.InstallStatus:
     except OSError as e:
         raise PackError(f"copying OpenPose failed: {e}") from e
     finally:
-        if new.exists() or _is_link(new):
+        if _exists(new):
             _remove(new)
     return ops.check_install(dest)
 
@@ -346,13 +429,39 @@ def _report_sizes(plan: list[CopyItem], dest: Path) -> None:
 # --------------------------------------------------------------------------- #
 # zip
 # --------------------------------------------------------------------------- #
-def _zip_entries(bundle: Path) -> tuple[list[Path], list[Path]]:
-    """(folders, files) of the bundle for the zip, without `ZIP_EXCLUDE_DIRS`."""
+def bundle_entries(bundle: Path, include: Sequence[str] = ()) -> tuple[list[Path], list[Path]]:
+    """(zipped, left out): the top-level entries of the PoseAssess folder.
+
+    Zipped are PoseAssess's own folders / files (`BUNDLE_DIRS`, `BUNDLE_FILE_PATTERNS`) and the
+    names in `include`; everything else (``recordings``, projects, ...) is left out.
+    """
+    extra = {n.lower() for n in include}
+    keep, skip = [], []
+    for entry in sorted(bundle.iterdir(), key=lambda p: p.name.lower()):
+        low = entry.name.lower()
+        own = ((low in BUNDLE_DIRS and entry.is_dir())
+               or (entry.is_file() and _matches(entry.name, BUNDLE_FILE_PATTERNS)))
+        (keep if own or low in extra else skip).append(entry)
+    return keep, skip
+
+
+def _zip_entries(entries: Sequence[Path]) -> tuple[list[Path], list[Path]]:
+    """(folders, files) for the zip below the top-level `entries`.
+
+    `ZIP_EXCLUDE_DIRS` are skipped everywhere, ``__pycache__`` only in `PYCACHE_FREE_DIRS`.
+    """
     dirs, files = [], []
-    for dirpath, dirnames, filenames in os.walk(bundle):
-        dirnames[:] = sorted(d for d in dirnames if d.lower() not in ZIP_EXCLUDE_DIRS)
-        dirs += [Path(dirpath, d) for d in dirnames]
-        files += [Path(dirpath, f) for f in sorted(filenames)]
+    for entry in entries:
+        if not entry.is_dir():
+            files.append(entry)
+            continue
+        dirs.append(entry)
+        skip = ZIP_EXCLUDE_DIRS | ({"__pycache__"} if entry.name.lower() in PYCACHE_FREE_DIRS
+                                   else set())
+        for dirpath, dirnames, filenames in os.walk(entry):
+            dirnames[:] = sorted(d for d in dirnames if d.lower() not in skip)
+            dirs += [Path(dirpath, d) for d in dirnames]
+            files += [Path(dirpath, f) for f in sorted(filenames)]
     return dirs, files
 
 
@@ -363,13 +472,16 @@ def _set_level(zinfo: zipfile.ZipInfo, level: int) -> None:
         zinfo._compresslevel = level
 
 
-def write_zip(bundle: Path, zip_path: Path) -> int:
+def write_zip(bundle: Path, zip_path: Path, entries: Sequence[Path] | None = None) -> int:
     """Zip `bundle` (the folder itself, as the top entry) to `zip_path`; returns the zip size.
 
+    Only the top-level `entries` go in (default: `bundle_entries`, PoseAssess's own files).
     Written as ``<zip>.part`` and renamed when complete; the part file is deleted on failure.
     """
     top = bundle.name or "PoseAssess"
-    dirs, files = _zip_entries(bundle)
+    if entries is None:
+        entries = bundle_entries(bundle)[0]
+    dirs, files = _zip_entries(entries)
     sizes = [_size(f) for f in files]
     total = sum(sizes)
     part = zip_path.with_name(zip_path.name + ".part")
@@ -409,8 +521,14 @@ def write_zip(bundle: Path, zip_path: Path) -> int:
 # --------------------------------------------------------------------------- #
 # command line
 # --------------------------------------------------------------------------- #
+class _Parser(argparse.ArgumentParser):
+    def error(self, message: str):  # usage errors exit with 64: 2 means "OpenPose not ready"
+        self.print_usage(sys.stderr)
+        self.exit(EXIT_USAGE, f"{self.prog}: error: {message}\n")
+
+
 def build_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(
+    ap = _Parser(
         prog="python -m poseassess.tools.pack_openpose",
         description="Make the lab's INTERNAL PoseAssess package with OpenPose (BODY_25B) "
                     "included: copies the needed parts of this PC's OpenPose into the "
@@ -423,11 +541,15 @@ def build_parser() -> argparse.ArgumentParser:
     out.add_argument("--no-zip", action="store_true",
                      help="only copy OpenPose into the PoseAssess folder, do not write a zip")
     out.add_argument("--zip-path", metavar="PATH", default=None,
-                     help="zip file to write (default: <folder>_with_OpenPose.zip next to the "
-                          "PoseAssess folder)")
+                     help="zip file (*.zip) to write, or a folder to write "
+                          "<folder>_with_OpenPose.zip into (default: next to the PoseAssess "
+                          "folder)")
+    ap.add_argument("--include", metavar="NAME", action="append", default=[],
+                    help="also zip this file / folder of the PoseAssess folder (repeatable); "
+                         "by default only PoseAssess's own files go in, not e.g. recordings")
     ap.add_argument("-y", "--yes", action="store_true",
                     help="do not ask (accept the license note, replace an existing openpose "
-                         "folder)")
+                         "folder and zip file)")
     return ap
 
 
@@ -442,20 +564,54 @@ def _confirm(ask: Callable[[str], str], prompt: str, *, default_yes: bool) -> bo
 
 
 def _zip_target(arg: str | None, bundle: Path) -> Path:
+    """The zip file for ``--zip-path``: a ``*.zip`` name is the file; an existing folder, a
+    path ending with a separator or a name without ``.zip`` is a folder for the default name."""
     default_name = (bundle.name or "PoseAssess") + ZIP_SUFFIX
-    if not arg:
+    text = (arg or "").strip().strip('"').strip()
+    if not text:
         return bundle.parent / default_name
-    p = Path(arg.strip().strip('"')).expanduser().absolute()
-    return p / default_name if p.is_dir() else p
+    p = Path(text).expanduser().absolute()
+    seps = tuple(s for s in (os.sep, os.altsep) if s)
+    if text.endswith(seps) or p.is_dir() or p.suffix.lower() != ".zip":
+        return p / default_name
+    return p
+
+
+def _zip_target_problem(zip_path: Path) -> str | None:
+    """Why `zip_path` cannot be written (checked before the long copy), else None."""
+    if zip_path.is_dir():
+        return f"{zip_path} is a folder"
+    for parent in zip_path.parents:
+        if parent.exists():
+            return None if parent.is_dir() else f"{parent} is a file, not a folder"
+    return None
 
 
 def run(args: argparse.Namespace, ask: Callable[[str], str]) -> int:
     bundle = ops.bundle_root()
     dest = bundle / DEST_NAME
     zip_path = None if args.no_zip else _zip_target(args.zip_path, bundle)
-    if not (bundle / "run.bat").is_file():
-        _say(f"Note: {bundle} has no run.bat; it does not look like the portable PoseAssess "
-             "folder.")
+
+    # 0. the PoseAssess folder
+    missing = [str(m) for m in BUNDLE_MARKERS if not (bundle / m).is_file()]
+    if missing:
+        _say(f"{bundle} is not the portable PoseAssess folder (missing: {', '.join(missing)}).")
+        _say("Run pack_with_openpose.bat in the PoseAssess_Portable folder.")
+        return EXIT_FAILED
+    for name in args.include:
+        if not _exists(bundle / name):
+            _say(f"--include {name}: there is no {name} in {bundle}")
+            return EXIT_USAGE
+    try:
+        recover_interrupted(dest)
+    except PackError as e:
+        _say(f"[ERROR] {e}")
+        return EXIT_FAILED
+    if _is_link(dest):
+        _say(f"{dest} is a link to {_link_target(dest)}, not a copy of OpenPose. Remove the "
+             f'link (e.g. rmdir "{dest}" in a console; the folder it points to is not touched) '
+             "and run this again.")
+        return EXIT_FAILED
 
     # 1. source
     if args.src:
@@ -468,8 +624,7 @@ def run(args: argparse.Namespace, ask: Callable[[str], str]) -> int:
             origin = "found automatically"
     if shown is None:
         _say(f"OpenPose not found: {origin}")
-        _say("Install OpenPose BODY_25B first (PoseAssess, OpenPose settings), or give its "
-             "folder with --src DIR.")
+        _say(f"Install OpenPose BODY_25B first ({GUI_HINT}), or give its folder with --src DIR.")
         return EXIT_NOT_READY
     _say(f"OpenPose source: {shown} ({origin})")
     st = ops.check_install(root if root is not None else args.src)
@@ -477,7 +632,7 @@ def run(args: argparse.Namespace, ask: Callable[[str], str]) -> int:
         _say("OpenPose is not ready for BODY_25B:")
         for e in st.errors:
             _say(f"  - {e}")
-        _say("Fix it first (PoseAssess, OpenPose settings), or give another folder with --src.")
+        _say(f"Fix it first ({GUI_HINT}), or give another folder with --src.")
         return EXIT_NOT_READY
     for w in st.warnings:
         _say(f"  warning: {w}")
@@ -495,9 +650,15 @@ def run(args: argparse.Namespace, ask: Callable[[str], str]) -> int:
     if zip_path is not None and _same_or_inside(zip_path, bundle):
         _say(f"Cannot write the zip inside the folder being zipped: {zip_path}")
         return EXIT_FAILED
-    if zip_path is not None and _same_or_inside(src, bundle):
-        _say(f"{src} is inside the PoseAssess folder, so the zip would contain the whole "
-             "OpenPose install. Move it out (e.g. to C:\\openpose) or use --no-zip.")
+    problem = _zip_target_problem(zip_path) if zip_path is not None else None
+    if problem:
+        _say(f"Cannot write the zip {zip_path}: {problem}.")
+        return EXIT_FAILED
+    zipped = next((e for e in bundle_entries(bundle, args.include)[0]
+                   if _same_or_inside(src, e)), None) if zip_path is not None else None
+    if zipped is not None:
+        _say(f"{src} is inside {zipped}, which goes into the zip, so the zip would contain the "
+             "whole OpenPose install. Move it out (e.g. to C:\\openpose) or use --no-zip.")
         return EXIT_FAILED
 
     # 3. license and questions
@@ -508,9 +669,14 @@ def run(args: argparse.Namespace, ask: Callable[[str], str]) -> int:
                                      default_yes=True):
         _say("Cancelled.")
         return EXIT_CANCELLED
-    if (dest.exists() or _is_link(dest)) and not args.yes:
+    if _exists(dest) and not args.yes:
         if not _confirm(ask, f"{dest} already exists. Replace it? [y/N]: ", default_yes=False):
             _say("Cancelled; the existing openpose folder was kept.")
+            return EXIT_CANCELLED
+    if zip_path is not None and _exists(zip_path) and not args.yes:
+        if not _confirm(ask, f"{zip_path} already exists. Replace it? [y/N]: ",
+                        default_yes=False):
+            _say("Cancelled; nothing was changed.")
             return EXIT_CANCELLED
 
     # 4. slim copy
@@ -537,11 +703,21 @@ def run(args: argparse.Namespace, ask: Callable[[str], str]) -> int:
     if zip_path is None:
         _say("No zip written (--no-zip).")
         return EXIT_OK
+    try:
+        keep, skip = bundle_entries(bundle, args.include)
+    except OSError as e:
+        _say(f"[ERROR] cannot list {bundle}: {e}")
+        return EXIT_FAILED
+    if skip:
+        _say("Left out of the zip (not part of PoseAssess, e.g. recordings or other data; add one "
+             "with --include NAME):")
+        for p in skip:
+            _say(f"  {p.name}{os.sep if p.is_dir() else ''}")
     if zip_path.exists():
         _say(f"Replacing the existing {zip_path}")
     _say(f"Zipping {bundle} ...")
     try:
-        size = write_zip(bundle, zip_path)
+        size = write_zip(bundle, zip_path, keep)
     except PackError as e:
         _say()
         _say(f"[ERROR] {e}")
@@ -553,12 +729,24 @@ def run(args: argparse.Namespace, ask: Callable[[str], str]) -> int:
 
 
 def main(argv: list[str] | None = None, *, ask: Callable[[str], str] = input) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    for name in args.include:
+        if not name.strip() or name in (".", "..") or any(s in name for s in "/\\:"):
+            parser.error(f"--include takes the name of a file / folder directly in the "
+                         f"PoseAssess folder, not {name!r}")
+    if args.include and args.no_zip:
+        parser.error("--include needs a zip (it cannot be used with --no-zip)")
     try:
         return run(args, ask)
     except KeyboardInterrupt:
         _say()
         _say("Cancelled.")
+        dest = ops.bundle_root() / DEST_NAME
+        old = dest.with_name(OLD_DIR)
+        if _exists(old) and not _exists(dest):
+            _say(f"The previous OpenPose copy is in {old}; the next run of this tool puts it "
+                 f"back (or rename it to {DEST_NAME}).")
         return EXIT_CANCELLED
 
 
