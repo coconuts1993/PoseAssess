@@ -11,3 +11,6 @@ __pycache__/
 *.pt
 *.task
 *.zip
+# a user's own OpenPose (CMU licence: never commit or pass it on with PoseAssess)
+/openpose/
+/openpose.download/

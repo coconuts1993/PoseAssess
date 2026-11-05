@@ -8,13 +8,15 @@ otherwise synthetic prototxt bytes with patched hashes stand in for them.
 """
 from __future__ import annotations
 
+import builtins
 import dataclasses
 import hashlib
 import io
 import os
 import subprocess
+import types
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -48,16 +50,22 @@ def _config_dir(tmp_path, monkeypatch):
 
 
 class FakeResponse(io.BytesIO):
-    """urlopen-like response that hands out at most `chunk` bytes per read()."""
+    """urlopen-like response that hands out at most `chunk` bytes per read() / read1()."""
 
     def __init__(self, data: bytes, chunk: int | None = None):
         super().__init__(data)
         self._chunk = chunk
 
-    def read(self, n: int = -1) -> bytes:
+    def _limit(self, n: int | None) -> int | None:
         if self._chunk is not None and (n is None or n < 0 or n > self._chunk):
-            n = self._chunk
-        return super().read(n)
+            return self._chunk
+        return n
+
+    def read(self, n: int = -1) -> bytes:
+        return super().read(self._limit(n))
+
+    def read1(self, n: int = -1) -> bytes:
+        return super().read1(self._limit(n))
 
 
 def opener_for(urls: dict[str, bytes], chunk: int | None = None, calls: list | None = None):
@@ -338,10 +346,66 @@ def test_install_caffemodel_keeps_official_prototxt_and_replaces_weights(tmp_pat
     src = root / ops.MODEL_SUBDIR / "pose_iter_464000.caffemodel"
     st = ops.install_caffemodel(root, src, opener=no_network)
     assert st.ok and st.variant == "1_25BSuperModel11FullVGG"
-    # installing the already-installed file again is a no-op
+    # installing the already-installed file again (same variant) is a no-op
     st = ops.install_caffemodel(root, root / ops.MODEL_SUBDIR / ops.CAFFEMODEL_NAME,
-                                variant="1_25BBkg", opener=no_network)
+                                variant="1_25BSuperModel11FullVGG", opener=no_network)
     assert st.ok and st.variant == "1_25BSuperModel11FullVGG"
+
+
+def test_install_caffemodel_explicit_other_variant_switches_prototxt(tmp_path, prototxts):
+    """The weights must match the prototxt: an explicit variant is never ignored."""
+    root = make_install(tmp_path / "openpose", prototxt=prototxts["1_25BSuperModel11FullVGG"],
+                        caffemodel=None)
+    src = tmp_path / "w.caffemodel"
+    src.write_bytes(b"w" * 10)
+    calls: list = []
+    st = ops.install_caffemodel(root, src, variant="1_25BBkg",
+                                opener=opener_for(_prototxt_urls(prototxts), calls=calls))
+    assert st.ok and st.variant == "1_25BBkg"
+    assert calls == [ops.BODY25B_VARIANTS["1_25BBkg"].prototxt_url]
+    mdir = root / ops.MODEL_SUBDIR
+    assert (mdir / ops.PROTOTXT_NAME).read_bytes() == prototxts["1_25BBkg"]
+    # an official prototxt can be downloaded again: no backup of it
+    assert sorted(p.name for p in mdir.iterdir()) == [ops.PROTOTXT_NAME, ops.CAFFEMODEL_NAME]
+
+
+def test_install_caffemodel_failed_download_changes_nothing(tmp_path, prototxts):
+    root = make_install(tmp_path / "openpose", prototxt=b"custom", caffemodel=None)
+    src = tmp_path / "w.caffemodel"
+    src.write_bytes(b"w" * 10)
+    url = ops.BODY25B_VARIANTS["1_25BBkg"].prototxt_url
+    with pytest.raises(RuntimeError, match="SHA-256"):
+        ops.install_caffemodel(root, src, opener=opener_for({url: b"tampered"}))
+    mdir = root / ops.MODEL_SUBDIR
+    assert sorted(p.name for p in mdir.iterdir()) == [ops.PROTOTXT_NAME]  # no .bak
+    assert (mdir / ops.PROTOTXT_NAME).read_bytes() == b"custom"
+
+
+def test_disk_errors_are_runtime_errors(tmp_path, prototxts):
+    """A folder that cannot be written (here: body_25b is a file) gives RuntimeError."""
+    root = make_install(tmp_path / "openpose", caffemodel=None)
+    mdir = root / ops.MODEL_SUBDIR
+    mdir.rmdir()
+    mdir.write_bytes(b"not a folder")
+    opener = opener_for(_prototxt_urls(prototxts))
+    with pytest.raises(RuntimeError, match="cannot write"):
+        ops.download_prototxt(root, "1_25BBkg", opener=opener)
+    src = tmp_path / "w.caffemodel"
+    src.write_bytes(b"w" * 10)
+    with pytest.raises(RuntimeError, match="cannot write"):
+        ops.install_caffemodel(root, src, opener=opener)
+    assert mdir.read_bytes() == b"not a folder"
+
+
+def test_install_caffemodel_copy_error_is_runtime_error(tmp_path, prototxts):
+    root = make_install(tmp_path / "openpose", prototxt=prototxts["1_25BBkg"], caffemodel=None)
+    mdir = root / ops.MODEL_SUBDIR
+    (mdir / ops.CAFFEMODEL_NAME).mkdir()  # in the way of the copy
+    src = tmp_path / "w.caffemodel"
+    src.write_bytes(b"w" * 10)
+    with pytest.raises(RuntimeError, match="could not copy"):
+        ops.install_caffemodel(root, src, opener=no_network)
+    assert not list(mdir.glob("*.part"))
 
 
 def test_install_caffemodel_replaces_unknown_prototxt_with_backup(tmp_path, prototxts):
@@ -453,10 +517,38 @@ def test_download_openpose_rejects_zip_slip(tmp_path):
     assert list((tmp_path / "dl").iterdir()) == []
 
 
-@pytest.mark.parametrize("name", ["/abs/evil.txt", "C:/evil.txt", "openpose\\..\\..\\evil.txt"])
+@pytest.mark.parametrize("name", [
+    "/abs/evil.txt", "C:/evil.txt", "openpose\\..\\..\\evil.txt", "",
+    # a drive in the middle: on Windows Path("D:/dl").joinpath("C:", ...) switches drive
+    "openpose/C:/evil.txt", "openpose/C:evil.txt",
+    "openpose/bin/x:stream",                     # NTFS alternate data stream
+    "openpose/\\\\?\\C:/x", "\\\\server\\share\\x", "//server/share/x",
+    "openpose/bin/CON", "openpose/bin/nul.txt", "openpose/bin/COM1.dll",  # devices
+    "openpose/bin/evil. ", "openpose/bin/evil.", "openpose/bin/a|b", "openpose/bin/a\x00b",
+])
 def test_safe_member_rejects(name):
     with pytest.raises(RuntimeError, match="unsafe path"):
         ops._safe_member(name)
+
+
+@pytest.mark.parametrize("name", [  # names from the official 1.7.0 archive
+    "openpose/", "openpose/bin/en-US/", "openpose/bin/OpenPoseDemo.exe",
+    "openpose/models/pose/body_25/pose_deploy.prototxt", "openpose/3rdparty/windows/wget/",
+    "openpose/bin/python/openpose/Debug/pyopenpose.pdb",
+])
+def test_safe_member_accepts_official_names(name):
+    assert ops._safe_member(name) == PurePosixPath(name)
+
+
+def test_extract_zip_checks_the_joined_path_too(tmp_path, monkeypatch):
+    """Second line of defence: a target outside the folder is refused even if a
+    name got past _safe_member."""
+    monkeypatch.setattr(ops, "_safe_member", lambda name: PurePosixPath(name))
+    data = make_zip({"openpose/bin/OpenPoseDemo.exe": b"MZ", "openpose/../evil.txt": b"pwned"})
+    with pytest.raises(RuntimeError, match="unsafe path"):
+        _download(tmp_path / "dl", data)
+    assert not (tmp_path / "dl" / "evil.txt").exists()
+    assert list((tmp_path / "dl").iterdir()) == []
 
 
 def test_download_openpose_sha_and_size_mismatch(tmp_path):
@@ -488,19 +580,133 @@ def test_download_openpose_refuses_existing_install(tmp_path):
 
 def test_download_openpose_network_error(tmp_path):
     with pytest.raises(RuntimeError, match="could not download"):
-        ops.download_openpose(tmp_path / "dl", url=URL, size=10, sha256="", opener=opener_for({}))
+        ops.download_openpose(tmp_path / "dl", url=URL, size=10, sha256="0" * 64,
+                              opener=opener_for({}))
     assert list((tmp_path / "dl").iterdir()) == []
 
 
+@pytest.mark.parametrize("kw", [{"sha256": ""}, {"sha256": None}, {"sha256": "abc"},
+                                {"size": 0}])
+def test_download_openpose_requires_size_and_sha256(tmp_path, kw):
+    with pytest.raises(ValueError):
+        ops.download_openpose(tmp_path / "dl", url=URL, opener=no_network, **kw)
+    assert not (tmp_path / "dl").exists()
+
+
+def test_download_openpose_creates_only_folders_in_dest_parent(tmp_path, monkeypatch):
+    """A drive root such as C:\\ lets ordinary users create folders, not files."""
+    data = release_zip()
+    dest = tmp_path / "dl"
+    real_open = builtins.open
+
+    def root_like_open(file, mode="r", *args, **kwargs):
+        if any(m in mode for m in "wax+") and Path(file).parent == dest:
+            raise PermissionError(13, "Permission denied", str(file))
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", root_like_open)
+    root = _download(dest, data)
+    assert ops.find_root(root) == root
+    assert sorted(p.name for p in dest.iterdir()) == ["openpose"]
+
+
+def test_download_openpose_local_write_error_is_not_a_network_error(tmp_path):
+    dest = tmp_path / "dl"
+    dest.mkdir()
+    (dest / ops._DOWNLOAD_DIR).write_bytes(b"a file in the way")
+    with pytest.raises(RuntimeError, match="cannot write") as err:
+        _download(dest, release_zip())
+    assert "could not download" not in str(err.value)
+    assert (dest / ops._DOWNLOAD_DIR).read_bytes() == b"a file in the way"  # not deleted
+
+
+def test_download_openpose_reads_what_has_arrived(tmp_path):
+    """read1(): on a slow link read(n) would wait for all n bytes (frozen progress / cancel)."""
+    data = release_zip()
+    sizes: list[int] = []
+
+    class Resp(FakeResponse):
+        def read(self, n=-1):
+            raise AssertionError("read(n) blocks until n bytes arrived")
+
+        def read1(self, n=-1):
+            sizes.append(n)
+            return super().read1(n)
+
+    ops.download_openpose(tmp_path, url=URL, size=len(data),
+                          sha256=hashlib.sha256(data).hexdigest(),
+                          opener=lambda url, timeout=None: Resp(data))
+    assert sizes and max(sizes) <= 64 * 1024
+
+
+def test_download_openpose_response_without_read1(tmp_path):
+    data = release_zip()
+
+    class Resp:
+        def __init__(self):
+            self._buf = io.BytesIO(data)
+
+        def read(self, n=-1):
+            return self._buf.read(n)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self._buf.close()
+
+    root = ops.download_openpose(tmp_path, url=URL, size=len(data),
+                                 sha256=hashlib.sha256(data).hexdigest(),
+                                 opener=lambda url, timeout=None: Resp())
+    assert ops.find_root(root) == root
+
+
+def test_download_openpose_needs_room_for_zip_and_unpacked_files(tmp_path, monkeypatch):
+    gb = 10 ** 9
+    monkeypatch.setattr(ops.shutil, "disk_usage",
+                        lambda path: types.SimpleNamespace(total=100 * gb, used=99 * gb, free=gb))
+    assert ops.OFFICIAL_ZIP_SIZE < gb < ops.OFFICIAL_ZIP_SIZE + ops.OFFICIAL_UNPACKED_SIZE
+    with pytest.raises(RuntimeError, match="not enough free disk space") as err:
+        ops.download_openpose(tmp_path / "dl", opener=no_network)
+    assert "1.4 GB needed" in str(err.value)
+
+
+@pytest.mark.parametrize("sub", [(), ("sub",)])
+def test_download_openpose_refuses_the_poseassess_folder(sub):
+    """PoseAssess is copied to other PCs; OpenPose must not travel with it."""
+    target = ops.bundle_root().joinpath(*sub)
+    with pytest.raises(RuntimeError, match="PoseAssess folder"):
+        ops.download_openpose(target, opener=no_network)
+    assert not (ops.bundle_root() / "openpose").exists()
+    assert not (ops.bundle_root() / ops._DOWNLOAD_DIR).exists()
+    assert not (ops.bundle_root() / "sub").exists()
+
+
 def test_official_release_constants():
-    assert ops.OFFICIAL_ZIP_URL.endswith("/v1.7.0/" + ops.OFFICIAL_ZIP_NAME)
-    assert ops.OFFICIAL_ZIP_URL.startswith(
-        "https://github.com/CMU-Perceptual-Computing-Lab/openpose/releases/download/")
-    assert len(ops.OFFICIAL_ZIP_SHA256) == 64
+    """The pinned values the integrity checks rely on (a typo would ship green otherwise)."""
+    assert ops.OFFICIAL_ZIP_URL == (
+        "https://github.com/CMU-Perceptual-Computing-Lab/openpose/releases/download/v1.7.0/"
+        "openpose-1.7.0-binaries-win64-gpu-python3.7-flir-3d_recommended.zip")
+    assert ops.OFFICIAL_ZIP_NAME == ops.OFFICIAL_ZIP_URL.rsplit("/", 1)[1]
+    assert ops.OFFICIAL_ZIP_SIZE == 437912637
+    assert ops.OFFICIAL_ZIP_SHA256 == (
+        "82ecf470c81b001d1b34873081c0157821c75a0557d926c7427f688d5cf0b25d")
     assert ops.MODEL_SUBDIR == Path("models", "pose", "body_25b")
-    assert set(ops.BODY25B_VARIANTS) == set(VARIANTS)
+    assert ops.CAFFEMODEL_NAME == "pose_iter_XXXXXX.caffemodel"
+    assert ops.PROTOTXT_NAME == "pose_deploy.prototxt"
+    assert (ops.MODEL_POSE, ops.NET_RESOLUTION) == ("BODY_25B", "-1x480")
+    raw = ("https://raw.githubusercontent.com/CMU-Perceptual-Computing-Lab/openpose_train/"
+           "master/experimental_models")
+    expected = {
+        "1_25BBkg": "6b05f4dc5139b70bb7b48ad90534671edef41f03f387bfd82bf6db1fa9ddb405",
+        "1_25BSuperModel11FullVGG":
+            "9fe1dc100e6e88be8d2773a15a6bdeef2001ce6e60d3d8b6f3502f692c07ed24",
+    }
+    assert set(ops.BODY25B_VARIANTS) == set(expected)
     for key, v in ops.BODY25B_VARIANTS.items():
-        assert v.name == key and f"/{key}/body_25b/pose_deploy.prototxt" in v.prototxt_url
+        assert v.name == key
+        assert v.prototxt_url == f"{raw}/{key}/body_25b/pose_deploy.prototxt"
+        assert v.prototxt_sha256 == expected[key]
 
 
 # --------------------------------------------------------------------------- #

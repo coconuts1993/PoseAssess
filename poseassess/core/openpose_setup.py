@@ -7,7 +7,8 @@ that forbids redistribution, so PoseAssess never bundles it. Instead this module
   computer, or a few usual places such as ``C:\\openpose``) and checks that it
   can run BODY_25B (`check_install`, `resolve_openpose_dir`);
 * downloads the OFFICIAL Windows GPU release from CMU's GitHub onto the user's
-  PC, after the user accepted the licence (`download_openpose`);
+  PC, after the user accepted the licence (`download_openpose`), never into the
+  PoseAssess folder (that folder is copied to other PCs);
 * installs the BODY_25B files: the official ``pose_deploy.prototxt`` of one of
   the two variants (`download_prototxt`) and the weights the user supplies
   (`install_caffemodel`; there is no official download of them any more);
@@ -28,6 +29,7 @@ Qt-free: the GUI runs the slow functions in a worker thread.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import http.client
 import json
@@ -36,6 +38,7 @@ import os
 import shutil
 import subprocess
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from dataclasses import dataclass, field
@@ -53,6 +56,8 @@ OFFICIAL_ZIP_URL = ("https://github.com/CMU-Perceptual-Computing-Lab/openpose/re
                     f"download/v{OFFICIAL_VERSION}/{OFFICIAL_ZIP_NAME}")
 OFFICIAL_ZIP_SIZE = 437_912_637
 OFFICIAL_ZIP_SHA256 = "82ecf470c81b001d1b34873081c0157821c75a0557d926c7427f688d5cf0b25d"
+#: Sum of the file sizes in the official archive (453 entries).
+OFFICIAL_UNPACKED_SIZE = 994_329_639
 LICENSE_URL = "https://github.com/CMU-Perceptual-Computing-Lab/openpose/blob/master/LICENSE"
 
 NET_RESOLUTION = "-1x480"
@@ -69,7 +74,9 @@ MIN_COMPUTE_CAP = (5, 2)
 MAX_COMPUTE_CAP = (10, 0)
 
 _TIMEOUT_S = 60
-_CHUNK = 1 << 20
+_CHUNK = 1 << 20          # unpacking
+_NET_CHUNK = 64 << 10     # downloading: small, so progress and cancel stay responsive
+_DOWNLOAD_DIR = "openpose.download"   # holds the .part file next to <dest>/openpose
 
 _TRAIN_RAW = ("https://raw.githubusercontent.com/CMU-Perceptual-Computing-Lab/"
               "openpose_train/master/experimental_models")
@@ -143,6 +150,14 @@ def _is_dir(p: Path) -> bool:
         return p.is_dir()
     except OSError:
         return False
+
+
+def _file_size(p: Path) -> int:
+    """Size of a regular file, 0 when it is missing / not a file / unreadable."""
+    try:
+        return p.stat().st_size if p.is_file() else 0
+    except OSError:
+        return 0
 
 
 def _clean_path(path: str | Path | None) -> Path | None:
@@ -246,7 +261,7 @@ def check_install(path: str | Path | None) -> InstallStatus:
 
     caffemodel = mdir / CAFFEMODEL_NAME
     if _is_file(caffemodel):
-        if caffemodel.stat().st_size == 0:
+        if _file_size(caffemodel) == 0:
             errors.append(f"{MODEL_SUBDIR / CAFFEMODEL_NAME} is empty")
     else:
         others = sorted(mdir.glob("pose_iter_*.caffemodel")) if _is_dir(mdir) else []
@@ -365,7 +380,14 @@ def resolve_openpose_dir(project_setting: str | Path | None) -> tuple[Path | Non
 # --------------------------------------------------------------------------- #
 # Downloads and model installation
 # --------------------------------------------------------------------------- #
+# All failures raise RuntimeError with a short user-facing message, except an
+# unknown variant name or bad download parameters (ValueError: a programming error).
 Opener = Callable[..., object]
+
+
+def _unlink_quietly(path: Path) -> None:
+    with contextlib.suppress(OSError):
+        path.unlink(missing_ok=True)
 
 
 def _atomic_write(dest: Path, data: bytes) -> None:
@@ -375,7 +397,15 @@ def _atomic_write(dest: Path, data: bytes) -> None:
         part.write_bytes(data)
         os.replace(part, dest)
     finally:
-        part.unlink(missing_ok=True)
+        _unlink_quietly(part)
+
+
+def _write_file(dest: Path, data: bytes) -> None:
+    """`_atomic_write`; RuntimeError for disk problems (read-only folder, ...)."""
+    try:
+        _atomic_write(dest, data)
+    except OSError as e:
+        raise RuntimeError(f"cannot write {dest}: {e}") from e
 
 
 def _fetch(url: str, opener: Opener) -> bytes:
@@ -405,68 +435,123 @@ def _variant(name: str | None) -> Body25bVariant:
     return BODY25B_VARIANTS[key]
 
 
-def download_prototxt(root: str | Path, variant: str,
-                      *, opener: Opener = urllib.request.urlopen) -> Path:
-    """Download the variant's official prototxt to ``models/pose/body_25b/pose_deploy.prototxt``.
-
-    The file is written only when its SHA-256 matches; raises RuntimeError otherwise.
-    """
-    v = _variant(variant)
-    root = _install_root(root)
+def _fetch_prototxt(v: Body25bVariant, opener: Opener) -> bytes:
+    """The variant's official prototxt; RuntimeError unless its SHA-256 matches."""
     data = _fetch(v.prototxt_url, opener)
     got = hashlib.sha256(data).hexdigest()
     if got != v.prototxt_sha256:
         raise RuntimeError(f"downloaded {PROTOTXT_NAME} ({v.name}) has an unexpected "
                            f"SHA-256 ({got}); nothing was written")
+    return data
+
+
+def download_prototxt(root: str | Path, variant: str,
+                      *, opener: Opener = urllib.request.urlopen) -> Path:
+    """Download the variant's official prototxt to ``models/pose/body_25b/pose_deploy.prototxt``.
+
+    The file is written only when its SHA-256 matches; raises RuntimeError otherwise
+    and when it cannot be written.
+    """
+    v = _variant(variant)
+    root = _install_root(root)
+    data = _fetch_prototxt(v, opener)
     dest = model_dir(root) / PROTOTXT_NAME
-    _atomic_write(dest, data)
+    _write_file(dest, data)
     return dest
+
+
+def _replace_prototxt(prototxt: Path, v: Body25bVariant, opener: Opener) -> None:
+    """Install the official prototxt of `v`, keeping a non-official one as ``.bak``.
+
+    Downloads and checks it before touching the disk, so a failed download
+    changes nothing. An official prototxt is not backed up (it can be downloaded
+    again any time).
+    """
+    data = _fetch_prototxt(v, opener)
+    if _is_file(prototxt) and prototxt_variant(prototxt) is None:
+        bak = prototxt.with_name(PROTOTXT_NAME + ".bak")
+        try:
+            shutil.copyfile(prototxt, bak)
+        except OSError as e:
+            raise RuntimeError(f"cannot back up {prototxt} to {bak.name}: {e}") from e
+    _write_file(prototxt, data)
+
+
+def _copy_weights(src: Path, dest: Path) -> None:
+    """Atomic copy (``.part`` then replace); nothing to do when `src` already is `dest`."""
+    part = dest.with_name(dest.name + ".part")
+    try:
+        if _is_file(dest) and os.path.samefile(src, dest):
+            return
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, part)
+        os.replace(part, dest)
+    except OSError as e:
+        raise RuntimeError(f"could not copy {src} to {dest}: {e}") from e
+    finally:
+        _unlink_quietly(part)
 
 
 def install_caffemodel(root: str | Path, src: str | Path, *, variant: str | None = None,
                        opener: Opener = urllib.request.urlopen) -> InstallStatus:
     """Install user-supplied BODY_25B weights (copied as ``pose_iter_XXXXXX.caffemodel``).
 
-    An existing official prototxt is kept (the weights must match it); otherwise
-    the prototxt of `variant` (default "1_25BBkg") is downloaded first, keeping a
-    non-official one as ``pose_deploy.prototxt.bak``. The copy is atomic. Returns
-    `check_install` of the root.
+    The weights must match the prototxt. With `variant` None an installed official
+    prototxt is kept, whichever variant it is. Otherwise the official prototxt of
+    `variant` (default "1_25BBkg") is downloaded first when it is not the one
+    installed; a non-official prototxt is kept as ``pose_deploy.prototxt.bak``.
+    The copy is atomic. Returns `check_install` of the root. RuntimeError for
+    download / disk problems, ValueError for an unknown variant name.
     """
+    wanted = _variant(variant) if variant else None
     root = _install_root(root)
     src = Path(src)
-    if not _is_file(src) or src.stat().st_size == 0:
+    if _file_size(src) == 0:
         raise RuntimeError(f"{src} is not a (non-empty) file")
     mdir = model_dir(root)
     prototxt = mdir / PROTOTXT_NAME
-    if prototxt_variant(prototxt) is None:
-        v = _variant(variant)
-        if _is_file(prototxt):
-            shutil.copyfile(prototxt, prototxt.with_name(PROTOTXT_NAME + ".bak"))
-        download_prototxt(root, v.name, opener=opener)
-
-    dest = mdir / CAFFEMODEL_NAME
-    if not (_is_file(dest) and os.path.samefile(src, dest)):
-        mdir.mkdir(parents=True, exist_ok=True)
-        part = dest.with_name(dest.name + ".part")
-        try:
-            shutil.copyfile(src, part)
-            os.replace(part, dest)
-        except OSError as e:
-            raise RuntimeError(f"could not copy {src} to {dest}: {e}") from e
-        finally:
-            part.unlink(missing_ok=True)
+    installed = prototxt_variant(prototxt)
+    if installed is None or (wanted is not None and wanted.name != installed):
+        _replace_prototxt(prototxt, wanted or _variant(None), opener)
+    _copy_weights(src, mdir / CAFFEMODEL_NAME)
     return check_install(root)
 
 
+_WIN_BAD_CHARS = frozenset('<>:"|?*')
+_WIN_DEVICES = frozenset({"con", "prn", "aux", "nul",
+                          *(f"com{i}" for i in range(10)), *(f"lpt{i}" for i in range(10))})
+
+
+def _bad_component(part: str) -> bool:
+    """True for a path component that is unsafe or special on Windows."""
+    return (part == ".."
+            or part != part.rstrip(". ")             # Windows drops trailing dots / spaces
+            or any(c in _WIN_BAD_CHARS or ord(c) < 32 for c in part)  # ':' = drive / stream
+            or part.split(".")[0].rstrip(" ").lower() in _WIN_DEVICES)
+
+
 def _safe_member(name: str) -> PurePosixPath:
-    """Relative path of a zip member; RuntimeError for absolute / drive / '..' paths."""
-    norm = name.replace("\\", "/")
-    rel = PurePosixPath(norm)
-    win = PureWindowsPath(name)
-    if (rel.is_absolute() or win.drive or win.root or ".." in rel.parts
-            or not rel.parts):
+    """Relative path of a zip member, safe to join to the target folder on any OS.
+
+    RuntimeError for absolute / UNC / drive paths, '..', and components Windows
+    treats specially: anything with ':' (``C:x`` switches drive, ``x:stream`` is
+    an alternate data stream), reserved device names (CON, NUL.txt, ...),
+    trailing dots or spaces, and characters not allowed in Windows file names.
+    """
+    rel = PurePosixPath(name.replace("\\", "/"))
+    if (rel.is_absolute() or PureWindowsPath(name).anchor or not rel.parts
+            or any(_bad_component(part) for part in rel.parts)):
         raise RuntimeError(f"unsafe path in the OpenPose archive: {name!r}")
     return rel
+
+
+def _is_inside(folder: str, target: str) -> bool:
+    """True when absolute path `target` is `folder` or below it."""
+    try:
+        common = os.path.commonpath([folder, target])
+    except ValueError:  # different drives (Windows)
+        return False
+    return os.path.normcase(common) == os.path.normcase(folder)
 
 
 def _no_space_message(folder: Path, need: int, free: int) -> str:
@@ -477,24 +562,31 @@ def _no_space_message(folder: Path, need: int, free: int) -> str:
 def _extract_zip(zip_path: Path, dest: Path, cancelled: Callable[[], bool] | None) -> None:
     """Unpack into `dest`, dropping the archive's top ``openpose/`` folder.
 
-    Every member name is checked before anything is written (no zip-slip).
+    Every member is checked before anything is written: its name (`_safe_member`)
+    and that the joined target path stays inside `dest` (no zip-slip).
     """
     with zipfile.ZipFile(zip_path) as zf:
         members = [(info, _safe_member(info.filename)) for info in zf.infolist()]
         tops = {rel.parts[0].lower() for _, rel in members}
         strip = 1 if tops == {"openpose"} else 0
-        need = sum(info.file_size for info, _ in members)
-        free = shutil.disk_usage(dest.parent).free
-        if need > free:
-            raise RuntimeError(_no_space_message(dest.parent, need, free))
-        dest.mkdir(exist_ok=True)
+        base = os.path.abspath(dest)
+        plan = []
         for info, rel in members:
-            if cancelled and cancelled():
-                raise RuntimeError("OpenPose download cancelled")
             parts = rel.parts[strip:]
             if not parts:
                 continue
             target = dest.joinpath(*parts)
+            if not _is_inside(base, os.path.abspath(target)):
+                raise RuntimeError(f"unsafe path in the OpenPose archive: {info.filename!r}")
+            plan.append((info, target))
+        need = sum(info.file_size for info, _ in plan)
+        free = shutil.disk_usage(dest.parent).free
+        if need > free:
+            raise RuntimeError(_no_space_message(dest.parent, need, free))
+        dest.mkdir(exist_ok=True)
+        for info, target in plan:
+            if cancelled and cancelled():
+                raise RuntimeError("OpenPose download cancelled")
             if info.is_dir():
                 target.mkdir(parents=True, exist_ok=True)
                 continue
@@ -503,29 +595,65 @@ def _extract_zip(zip_path: Path, dest: Path, cancelled: Callable[[], bool] | Non
                 shutil.copyfileobj(fin, fout, _CHUNK)
 
 
+def _read_some(resp) -> bytes:
+    """Up to `_NET_CHUNK` bytes as soon as some arrived (``read1``): on a slow link
+    ``read(n)`` would block until all n bytes are in, freezing progress and cancel."""
+    read1 = getattr(resp, "read1", None)
+    return read1(_NET_CHUNK) if read1 is not None else resp.read(_NET_CHUNK)
+
+
 def _stream_to_file(url: str, part: Path, size: int, opener: Opener,
                     progress: Callable[[int, int], None] | None,
                     cancelled: Callable[[], bool] | None) -> str:
-    """Download `url` into `part`; returns the SHA-256 of the bytes."""
+    """Download `url` (exactly `size` bytes) into `part`; returns the SHA-256 of the bytes.
+
+    RuntimeError "cannot write ..." for local disk problems, "could not download
+    ..." for network problems.
+    """
+    try:
+        part.parent.mkdir(parents=True, exist_ok=True)
+        f = open(part, "wb")
+    except OSError as e:
+        raise RuntimeError(f"cannot write {part}: {e}") from e
     h = hashlib.sha256()
     done = 0
-    with opener(url, timeout=_TIMEOUT_S) as resp, open(part, "wb") as f:
-        while True:
-            if cancelled and cancelled():
-                raise RuntimeError("OpenPose download cancelled")
-            chunk = resp.read(_CHUNK)
-            if not chunk:
-                break
-            f.write(chunk)
-            h.update(chunk)
-            done += len(chunk)
-            if size and done > size:
-                raise RuntimeError(f"download is larger than expected ({size} bytes)")
-            if progress:
-                progress(done, size)
-    if size and done != size:
+    with f:
+        try:
+            resp = opener(url, timeout=_TIMEOUT_S)
+        except (urllib.error.URLError, http.client.HTTPException, OSError) as e:
+            raise RuntimeError(f"could not download {url}: {e}") from e
+        with resp:
+            while True:
+                if cancelled and cancelled():
+                    raise RuntimeError("OpenPose download cancelled")
+                try:
+                    chunk = _read_some(resp)
+                except (http.client.HTTPException, OSError) as e:
+                    raise RuntimeError(f"could not download {url}: {e}") from e
+                if not chunk:
+                    break
+                done += len(chunk)
+                if done > size:
+                    raise RuntimeError(f"download is larger than expected ({size} bytes)")
+                try:
+                    f.write(chunk)
+                except OSError as e:
+                    raise RuntimeError(f"cannot write {part}: {e}") from e
+                h.update(chunk)
+                if progress:
+                    progress(done, size)
+    if done != size:
         raise RuntimeError(f"download incomplete: got {done} of {size} bytes")
     return h.hexdigest()
+
+
+def _inside_bundle(path: Path) -> bool:
+    """True when `path` is the PoseAssess folder or inside it."""
+    try:
+        p, bundle = path.resolve(), bundle_root()
+    except OSError:
+        return False
+    return p == bundle or bundle in p.parents
 
 
 def download_openpose(dest_parent: str | Path, *,
@@ -537,33 +665,51 @@ def download_openpose(dest_parent: str | Path, *,
     """Download and unpack the official OpenPose release into ``<dest_parent>/openpose``.
 
     Only call this after the user accepted the OpenPose licence (`LICENSE_URL`).
-    Streams to ``<dest_parent>/<zip>.part`` (`progress(done_bytes, total_bytes)`),
-    checks size and SHA-256, extracts safely and returns the install root
-    (``<dest_parent>/openpose`` for the official archive).
-    Raises RuntimeError on failure or when `cancelled()` turns true; partial files
-    are removed. Refuses to overwrite an existing ``<dest_parent>/openpose``.
+    A folder inside PoseAssess is refused: PoseAssess is copied to other PCs, and
+    OpenPose must not be passed on. ``C:\\`` is a good `dest_parent` (gives
+    ``C:\\openpose``): only folders are created directly in `dest_parent`, which a
+    drive root allows ordinary users. The archive is streamed to
+    ``<dest_parent>/openpose.download/<zip>.part`` (`progress(done_bytes, total_bytes)`),
+    checked against `size` and `sha256` (both required), extracted safely (nothing
+    outside the target folder) and deleted; returns the install root
+    (``<dest_parent>/openpose``). Raises RuntimeError on failure or when
+    `cancelled()` turns true (partial files are removed), ValueError for a missing
+    `size` / `sha256`. Refuses to overwrite a non-empty ``<dest_parent>/openpose``.
     """
+    sha256 = (sha256 or "").strip().lower()
+    if len(sha256) != 64 or any(c not in "0123456789abcdef" for c in sha256):
+        raise ValueError("sha256 must be the SHA-256 (64 hex digits) of the archive")
+    if not size or size <= 0:
+        raise ValueError("size must be the size of the archive in bytes")
     dest_parent = Path(dest_parent)
     final = dest_parent / "openpose"
-    if final.exists() and (not final.is_dir() or any(final.iterdir())):
+    if _inside_bundle(final):
+        raise RuntimeError(f"do not put OpenPose inside the PoseAssess folder ({bundle_root()}): "
+                           "it would be copied along with PoseAssess, and the OpenPose licence "
+                           "does not allow passing it on. Choose another folder, e.g. C:\\")
+    try:
+        occupied = final.exists() and (not final.is_dir() or any(final.iterdir()))
+    except OSError as e:
+        raise RuntimeError(f"cannot use {final}: {e}") from e
+    if occupied:
         raise RuntimeError(f"{final} already exists; choose another folder or remove it")
     try:
         dest_parent.mkdir(parents=True, exist_ok=True)
         free = shutil.disk_usage(dest_parent).free
     except OSError as e:
         raise RuntimeError(f"cannot write to {dest_parent}: {e}") from e
-    if size and free < size:
-        raise RuntimeError(_no_space_message(dest_parent, size, free))
+    # the archive and its unpacked files are on disk together for a while
+    need = size + (OFFICIAL_UNPACKED_SIZE if sha256 == OFFICIAL_ZIP_SHA256 else 3 * size)
+    if free < need:
+        raise RuntimeError(_no_space_message(dest_parent, need, free))
 
-    zip_name = url.rsplit("/", 1)[-1] or OFFICIAL_ZIP_NAME
-    part = dest_parent / f"{zip_name}.part"
+    zip_name = PurePosixPath(urllib.parse.urlsplit(url).path).name or OFFICIAL_ZIP_NAME
+    work = dest_parent / _DOWNLOAD_DIR
+    part = work / f"{zip_name}.part"
     done = False
     try:
-        try:
-            got = _stream_to_file(url, part, size, opener, progress, cancelled)
-        except (urllib.error.URLError, http.client.HTTPException, OSError) as e:
-            raise RuntimeError(f"could not download {url}: {e}") from e
-        if sha256 and got != sha256.lower():
+        got = _stream_to_file(url, part, size, opener, progress, cancelled)
+        if got != sha256:
             raise RuntimeError(f"downloaded {zip_name} has an unexpected SHA-256 ({got}); "
                                "it was deleted")
         # Unpacked in place (no folder rename afterwards: on Windows a virus scanner
@@ -577,7 +723,9 @@ def download_openpose(dest_parent: str | Path, *,
             raise RuntimeError(f"{zip_name} does not contain {EXE_NAME}")
         done = True
     finally:
-        part.unlink(missing_ok=True)
+        _unlink_quietly(part)
+        with contextlib.suppress(OSError):
+            work.rmdir()  # only when empty: never deletes anything else
         if not done:
             shutil.rmtree(final, ignore_errors=True)
     return root
