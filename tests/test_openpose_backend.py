@@ -37,11 +37,6 @@ print("Starting OpenPose demo...", flush=True)
 print("cwd=" + os.getcwd(), flush=True)
 for i in range(int(env("FAKE_OP_NOISE", "0"))):
     print(f"noise {i}", flush=True)
-code = int(env("FAKE_OP_EXIT", "0"))
-if code:
-    print("Error:", file=sys.stderr, flush=True)
-    print(env("FAKE_OP_ERROR", "fake failure"), file=sys.stderr, flush=True)
-    sys.exit(code)
 out, stem = opt("--write_json"), os.path.splitext(os.path.basename(opt("--video")))[0]
 for i in range(int(env("FAKE_OP_FRAMES", "3"))):
     kp = [v for k in range(25) for v in (float(i), float(k), 0.9)]
@@ -50,6 +45,11 @@ for i in range(int(env("FAKE_OP_FRAMES", "3"))):
     with open(os.path.join(out, f"{stem}_{i:012d}_keypoints.json"), "w") as f:
         json.dump(doc, f)
     time.sleep(float(env("FAKE_OP_DELAY", "0")))
+code = int(env("FAKE_OP_EXIT", "0"))
+if code:  # after the frames: a failure / crash part way leaves partial output
+    print("Error:", file=sys.stderr, flush=True)
+    print(env("FAKE_OP_ERROR", "fake failure"), file=sys.stderr, flush=True)
+    sys.exit(code)
 print("OpenPose demo successfully finished. Total time: 0.1 seconds.", flush=True)
 '''
 
@@ -81,7 +81,9 @@ def popen_calls(tmp_path, monkeypatch) -> list[dict]:
 
     def popen(cmd, **kwargs):
         calls.append({"cmd": list(cmd), **kwargs})
-        return real_popen([sys.executable, str(script), *cmd[1:]], **kwargs)
+        proc = real_popen([sys.executable, str(script), *cmd[1:]], **kwargs)
+        calls[-1]["proc"] = proc
+        return proc
 
     monkeypatch.setattr(ob.subprocess, "Popen", popen)
     return calls
@@ -126,6 +128,17 @@ def json_names(folder: Path) -> list[str]:
     return sorted(p.name for p in folder.glob("*.json"))
 
 
+def all_names(folder: Path) -> list[str]:
+    """Everything in `folder`, recursively (work folder included)."""
+    return sorted(str(p.relative_to(folder)) for p in folder.rglob("*"))
+
+
+def write_frames(folder: Path, n: int, run: str = "old") -> None:
+    folder.mkdir(parents=True, exist_ok=True)
+    for i in range(n):
+        (folder / f"frame_{i:05d}.json").write_text(json.dumps({"run": run}))
+
+
 def arg(cmd: list[str], name: str) -> str:
     return cmd[cmd.index(name) + 1]
 
@@ -157,7 +170,8 @@ def test_happy_path_renames_frames_reports_progress_and_runs_in_root(
     assert arg(cmd, "--model_pose") == "BODY_25B"
     assert arg(cmd, "--net_resolution") == "-1x480"
     assert arg(cmd, "--display") == "0" and arg(cmd, "--render_pose") == "0"
-    assert arg(cmd, "--video") == str(video) and arg(cmd, "--write_json") == str(out)
+    assert arg(cmd, "--video") == str(video)
+    assert arg(cmd, "--write_json") == str(out / ob._WORK_DIR)  # moved to out on success
     assert call["cwd"] == str(root)
     assert call["stdout"] == subprocess.PIPE and call["stderr"] == subprocess.STDOUT
     assert "text" not in call and "encoding" not in call  # bytes, decoded line by line
@@ -171,6 +185,7 @@ def test_happy_path_renames_frames_reports_progress_and_runs_in_root(
     frame_reports = [(f, t) for f, t, m in seen if "/12 frames" in m]
     assert frame_reports and all(t == 12 for _, t in frame_reports)
     assert seen[-1] == (12, 12, "cam01: 12 frames")
+    assert all_names(out) == [f"frame_{i:05d}.json" for i in range(12)]  # no work folder
 
 
 def test_second_run_replaces_earlier_results(tmp_path, popen_calls, monkeypatch):
@@ -178,26 +193,43 @@ def test_second_run_replaces_earlier_results(tmp_path, popen_calls, monkeypatch)
     video = make_video(tmp_path / "videos" / "cam01.avi", 3)
     out = tmp_path / "pose" / "cam01_json"
 
-    def no_rename(self, target):  # Windows: rename onto an existing file fails
-        if Path(target).exists():
-            raise FileExistsError(f"[WinError 183] {target}")
-        return original_rename(self, target)
-
-    original_rename = Path.rename
-    monkeypatch.setattr(Path, "rename", no_rename)
-
     monkeypatch.setenv("FAKE_OP_FRAMES", "5")
     monkeypatch.setenv("FAKE_OP_RUN", "first")
     assert run(root, video, out).frames_written == 5
-    # a stale file of an interrupted run must not be mixed in either
+    # stale files of an interrupted run must not be mixed in either: raw OpenPose
+    # output, and the work folder of a cancelled run (OpenPose killed with the pipeline)
     (out / "cam01_000000000099_keypoints.json").write_text("{}")
+    (out / ob._WORK_DIR).mkdir()
+    (out / ob._WORK_DIR / "cam01_000000000007_keypoints.json").write_text("{}")
 
     monkeypatch.setenv("FAKE_OP_FRAMES", "3")
     monkeypatch.setenv("FAKE_OP_RUN", "second")
     assert run(root, video, out).frames_written == 3
 
-    assert json_names(out) == ["frame_00000.json", "frame_00001.json", "frame_00002.json"]
+    assert all_names(out) == ["frame_00000.json", "frame_00001.json", "frame_00002.json"]
     assert {json.loads(p.read_text())["run"] for p in out.glob("*.json")} == {"second"}
+
+
+def test_move_frames_replaces_existing_targets(tmp_path, monkeypatch):
+    """Path.replace, not Path.rename: on Windows rename onto an existing file fails."""
+    work, out = tmp_path / "out" / ob._WORK_DIR, tmp_path / "out"
+    work.mkdir(parents=True)
+    write_frames(out, 1, run="old")
+    for i in (10, 2, 1):  # frame numbers, not names, give the order
+        (work / f"v_{i:012d}_keypoints.json").write_text(json.dumps({"run": f"new{i}"}))
+
+    def windows_rename(self, target):
+        if Path(target).exists():
+            raise FileExistsError(f"[WinError 183] {target}")
+        return original_rename(self, target)
+
+    original_rename = Path.rename
+    monkeypatch.setattr(Path, "rename", windows_rename)
+
+    assert ob._move_frames(work, out) == 3
+    assert [json.loads((out / f"frame_{i:05d}.json").read_text())["run"]
+            for i in range(3)] == ["new1", "new2", "new10"]
+    assert list(work.iterdir()) == []
 
 
 def test_failure_raises_with_openposes_last_output_lines(tmp_path, popen_calls, monkeypatch):
@@ -216,6 +248,63 @@ def test_failure_raises_with_openposes_last_output_lines(tmp_path, popen_calls, 
     assert len(msg.splitlines()) == ob.TAIL_LINES
 
 
+def test_failed_run_leaves_the_camera_folder_empty(tmp_path, popen_calls, monkeypatch):
+    """Neither the earlier results nor OpenPose's partial output stay behind."""
+    root = make_install(tmp_path / "openpose")
+    video = make_video(tmp_path / "videos" / "cam01.avi", 3)
+    out = tmp_path / "pose" / "cam01_json"
+    monkeypatch.setenv("FAKE_OP_FRAMES", "4")
+    run(root, video, out)
+
+    monkeypatch.setenv("FAKE_OP_FRAMES", "2")  # then out of GPU memory, say
+    monkeypatch.setenv("FAKE_OP_EXIT", "1")
+    with pytest.raises(RuntimeError, match=r"OpenPose failed \(exit 1\)"):
+        run(root, video, out)
+    assert all_names(out) == []
+
+
+def test_failure_while_moving_the_frames_leaves_the_camera_folder_empty(
+        tmp_path, popen_calls, monkeypatch):
+    root = make_install(tmp_path / "openpose")
+    video = make_video(tmp_path / "videos" / "cam01.avi", 3)
+    out = tmp_path / "out"
+    moved: list[str] = []
+    original_replace = Path.replace
+
+    def replace(self, target):  # the 3rd file is locked (antivirus, Explorer preview)
+        if len(moved) == 2:
+            raise PermissionError(13, "The process cannot access the file", str(self))
+        moved.append(self.name)
+        return original_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", replace)
+    monkeypatch.setenv("FAKE_OP_FRAMES", "5")
+    with pytest.raises(RuntimeError, match="cannot move .*cam01_000000000002_keypoints"):
+        run(root, video, out)
+    assert len(moved) == 2 and all_names(out) == []
+
+
+def test_interrupted_run_kills_openpose_and_leaves_no_json(tmp_path, popen_calls, monkeypatch):
+    root = make_install(tmp_path / "openpose")
+    video = make_video(tmp_path / "videos" / "cam01.avi", 3)
+    out = tmp_path / "out"
+    write_frames(out, 3)
+    monkeypatch.setenv("FAKE_OP_FRAMES", "200")
+    monkeypatch.setenv("FAKE_OP_DELAY", "0.02")
+
+    class Stop(Exception):
+        pass
+
+    def progress(f, t, m):
+        if "frames (" in m and f >= 2:  # e.g. Ctrl+C while OpenPose is writing frames
+            raise Stop
+
+    with pytest.raises(Stop):
+        run(root, video, out, progress=progress)
+    assert popen_calls[0]["proc"].poll() is not None
+    assert all_names(out) == []
+
+
 def test_exit_0_without_json_is_a_clear_error(tmp_path, popen_calls, monkeypatch):
     root = make_install(tmp_path / "openpose")
     video = make_video(tmp_path / "videos" / "cam01.avi", 3)
@@ -223,6 +312,28 @@ def test_exit_0_without_json_is_a_clear_error(tmp_path, popen_calls, monkeypatch
     with pytest.raises(RuntimeError, match="wrote no keypoint files for cam01.avi") as ei:
         run(root, video, tmp_path / "out")
     assert "OpenPose demo successfully finished" in str(ei.value)
+    assert all_names(tmp_path / "out") == []
+
+
+@pytest.mark.parametrize("window", [60.0, 0.01])
+def test_output_lines_are_rate_limited(tmp_path, popen_calls, monkeypatch, window):
+    """A chatty OpenPose must not flood the log: at most _LINES_PER_WINDOW lines per
+    window go to progress, the others are counted (and all are in the error tail)."""
+    root = make_install(tmp_path / "openpose")
+    video = make_video(tmp_path / "videos" / "cam01.avi", 3)
+    monkeypatch.setattr(ob, "_LINES_WINDOW_S", window)
+    monkeypatch.setenv("FAKE_OP_NOISE", "300")
+    seen: list[str] = []
+    run(root, video, tmp_path / "out", progress=lambda f, t, m: seen.append(m))
+
+    note = "cam01 OpenPose: ("
+    shown = [m for m in seen if m.startswith("cam01 OpenPose: ") and not m.startswith(note)]
+    hidden = [int(m[len(note):].split()[0]) for m in seen if m.startswith(note)]
+    assert len(shown) + sum(hidden) == 303  # start, cwd, 300 noise, finished
+    assert hidden and all(n > 0 for n in hidden)
+    if window == 60.0:
+        assert len(shown) == ob._LINES_PER_WINDOW
+        assert seen[-2] == "cam01 OpenPose: (283 more output lines not shown)"
 
 
 def test_missing_video_and_missing_install(tmp_path, popen_calls):
@@ -242,15 +353,72 @@ def test_extra_args_and_options(tmp_path):
     assert cmd[-2:] == ["--number_people_max", "1"]
 
 
-def test_decode_falls_back_for_non_utf8_output():
+def test_decode_utf8_first_then_the_ansi_code_page(monkeypatch):
     assert ob._decode("Fehler: Datei fehlt".encode()) == "Fehler: Datei fehlt"
     assert ob._decode("C:\\データ".encode()) == "C:\\データ"
-    assert ob._decode(b"C:\\caf\xe9\xff").startswith("C:\\caf")  # never raises
+
+    monkeypatch.setattr(ob, "_locale_encoding", lambda: "cp932")  # Japanese Windows
+    assert ob._decode("エラー: C:\\データ".encode("cp932")) == "エラー: C:\\データ"
+    assert ob._decode("C:\\データ".encode()) == "C:\\データ"  # UTF-8 still wins
+    monkeypatch.setattr(ob, "_locale_encoding", lambda: "cp1252")  # Western Windows
+    assert ob._decode(b"C:\\caf\xe9") == "C:\\café"
+    assert ob._decode(b"caf\xe9\x81").startswith("café")  # undefined byte: no error
+    monkeypatch.setattr(ob, "_locale_encoding", lambda: "no-such-codec")
+    assert ob._decode(b"caf\xe9") == "café"  # latin-1 as the last resort
 
 
-def test_exit_text_shows_windows_ntstatus():
+def test_exit_text_shows_signed_codes_and_windows_crashes():
     assert ob._exit_text(1) == "exit 1"
-    assert ob._exit_text(3221225781) == "exit 3221225781 = 0xC0000135"
+    assert ob._exit_text(-9) == "exit -9"  # POSIX: killed by a signal
+    # OpenPoseDemo's own error exit (return -1), as Windows reports it
+    assert ob._exit_text(4294967295) == "exit -1 = 0xFFFFFFFF"
+    assert ob._exit_text(0xC0000135) == "exit 0xC0000135: a DLL was not found"
+    assert ob._exit_text(0xC0000374) == "exit -1073740940 = 0xC0000374"
+
+
+class _FakeKernel32:
+    """GetShortPathNameW of a drive with (or without) 8.3 names."""
+
+    def __init__(self, short: str | None):
+        self.short, self.calls = short, []
+
+    def GetShortPathNameW(self, long, buf, size):  # noqa: N802 - Windows API name
+        self.calls.append(long)
+        if self.short is None:
+            return 0  # failed (e.g. path gone)
+        buf.value = self.short
+        return len(self.short)
+
+
+def test_short_paths_go_to_openpose_and_the_frame_count(tmp_path, popen_calls, monkeypatch):
+    """OpenCV, like OpenPose, may not open a non-ASCII path: both get `_arg_path`."""
+    root = make_install(tmp_path / "openpose")
+    video = make_video(tmp_path / "videos" / "cam01.avi", 3)
+    short = "C:\\VIDEOS~1\\cam01.avi"
+    monkeypatch.setattr(ob, "_arg_path", lambda p: short if p == video else str(p))
+    counted: list[str] = []
+    monkeypatch.setattr(ob, "_frame_count", lambda v: counted.append(v) or 3)
+    run(root, video, tmp_path / "out")
+    assert counted == [short] and arg(popen_calls[0]["cmd"], "--video") == short
+
+
+def test_arg_path_uses_the_ascii_short_form_on_windows(monkeypatch):
+    long = Path("/Users/山田/動画/cam01.mp4")
+    monkeypatch.setattr(ob, "_is_windows", lambda: True)
+
+    k32 = _FakeKernel32("C:\\Users\\8B71~1\\8B95~1\\cam01.mp4")
+    monkeypatch.setattr(ob, "_kernel32", lambda: k32)
+    assert ob._arg_path(long) == "C:\\Users\\8B71~1\\8B95~1\\cam01.mp4"
+    assert ob._arg_path(Path("/videos/cam01.mp4")) == str(Path("/videos/cam01.mp4"))
+    assert k32.calls == [str(long)]  # ASCII paths are passed as they are
+
+    for short in (str(long), None):  # 8.3 names disabled on the drive / call failed
+        monkeypatch.setattr(ob, "_kernel32", lambda k=_FakeKernel32(short): k)
+        assert ob._arg_path(long) == str(long)
+
+    monkeypatch.setattr(ob, "_is_windows", lambda: False)
+    monkeypatch.setattr(ob, "_kernel32", lambda: pytest.fail("not on Windows"))
+    assert ob._arg_path(long) == str(long)
 
 
 # --------------------------------------------------------------------------- #
@@ -300,6 +468,47 @@ def test_job_limit_structure_has_the_windows_layout():
     assert ctypes.sizeof(ob._ExtendedLimitInformation) == expected
 
 
+def test_job_object_failure_warns_only_while_openpose_runs(tmp_path, popen_calls, monkeypatch):
+    """When OpenPose ended right away (e.g. 0xC0000135) AssignProcessToJobObject fails
+    too; that must not add a misleading 'Cancel may not stop OpenPose' warning."""
+    root = make_install(tmp_path / "openpose")
+    video = make_video(tmp_path / "videos" / "cam01.avi", 3)
+    monkeypatch.setattr(ob, "_is_windows", lambda: True)
+    monkeypatch.setattr(ob, "_popen_kwargs",
+                        lambda: {"stdin": subprocess.DEVNULL, "stdout": subprocess.PIPE,
+                                 "stderr": subprocess.STDOUT})
+    monkeypatch.setattr(ob, "close_handle", lambda h: pytest.fail("no job to close"))
+    warning = "cam01: warning: Cancel may not stop OpenPose ([Errno 5] Access is denied)"
+
+    def deny(pid):
+        raise OSError(5, "Access is denied")
+
+    monkeypatch.setattr(ob, "kill_with_parent", deny)  # OpenPose still starting up
+    monkeypatch.setenv("FAKE_OP_DELAY", "0.1")
+    seen: list[str] = []
+    run(root, video, tmp_path / "a", progress=lambda f, t, m: seen.append(m))
+    assert warning in seen
+
+    if not hasattr(os, "waitid"):
+        return
+
+    def deny_after_exit(pid):
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:  # wait until it has ended, without reaping it
+            if os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
+                break
+            time.sleep(0.01)
+        raise OSError(5, "Access is denied")
+
+    monkeypatch.setattr(ob, "kill_with_parent", deny_after_exit)
+    monkeypatch.setenv("FAKE_OP_DELAY", "0")
+    monkeypatch.setenv("FAKE_OP_EXIT", "1")
+    seen.clear()
+    with pytest.raises(RuntimeError, match=r"OpenPose failed \(exit 1\)"):
+        run(root, video, tmp_path / "b", progress=lambda f, t, m: seen.append(m))
+    assert not any("Cancel may not stop" in m for m in seen)
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows Job Objects")
 def test_job_object_kills_the_process_when_closed():
     job = ob.create_kill_on_close_job()
@@ -344,6 +553,48 @@ def test_pipeline_runs_the_resolved_install_and_logs_openpose_output(
     assert "  cam01 OpenPose: Starting OpenPose demo..." in logs  # not thinned out
     assert popen_calls[0]["cwd"] == str(root)
     assert json_names(project.pose2d_cam_dir(1)) == [f"frame_{i:05d}.json" for i in range(4)]
+
+
+def test_pipeline_logs_a_usual_place_and_an_unusable_project_setting(
+        tmp_path, project, popen_calls, monkeypatch):
+    from poseassess.core.pipeline import Pipeline
+
+    root = make_install(tmp_path / "openpose")
+    monkeypatch.setattr(ops, "candidate_dirs", lambda: [root])  # e.g. C:\\openpose
+    _openpose_project(project, None)
+    logs: list[str] = []
+    Pipeline(project, progress=logs.append)._run_plugin_pose("openpose")
+    assert f"[pose:openpose] OpenPose at {root} (found in a usual place)" in logs
+    assert not any("is not usable" in m for m in logs)
+
+    broken = make_install(tmp_path / "broken", caffemodel=None)
+    project.config.openpose_dir = str(broken)
+    logs.clear()
+    Pipeline(project, progress=logs.append)._run_plugin_pose("openpose")
+    (warning,) = [m for m in logs if "is not usable" in m]
+    assert warning.startswith(f"[pose:openpose] warning: the OpenPose folder set on 1. "
+                              f"Project ({broken}) is not usable: missing BODY_25B weights")
+    assert f"[pose:openpose] OpenPose at {root} (found in a usual place)" in logs
+    assert popen_calls[-1]["cwd"] == str(root)
+
+
+def test_pipeline_failure_leaves_no_older_results_in_any_camera(
+        tmp_path, project, popen_calls, monkeypatch):
+    """Pose2Sim reads every camNN_json: after cam01 fails, cam02 must not keep the
+    results of an earlier run (it was never re-run)."""
+    from poseassess.core.pipeline import Pipeline
+
+    _openpose_project(project, make_install(tmp_path / "openpose"))
+    make_video(project.videos_dir / "cam02.avi", 4)
+    for i in (1, 2):
+        write_frames(project.pose2d_cam_dir(i), 4)
+    (project.pose2d_cam_dir(2) / "cam02_000000000000.json").write_text("{}")  # rtmlib's
+    monkeypatch.setenv("FAKE_OP_EXIT", "1")
+    with pytest.raises(RuntimeError, match="OpenPose failed"):
+        Pipeline(project, progress=lambda m: None)._run_plugin_pose("openpose")
+    assert len(popen_calls) == 1
+    assert all_names(project.pose2d_cam_dir(1)) == []
+    assert all_names(project.pose2d_cam_dir(2)) == []
 
 
 def test_pipeline_without_install_says_where_to_set_it(tmp_path, project, popen_calls):

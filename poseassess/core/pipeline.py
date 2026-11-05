@@ -23,6 +23,23 @@ from typing import Callable, Optional
 
 ProgressFn = Callable[[str], None]
 
+# where openpose_setup.resolve_openpose_dir found the install
+_PROJECT_SETTING = "project setting"
+_REMEMBERED = "remembered on this computer"
+
+
+def _remove_json(folder: Path) -> None:
+    """Delete the *.json files (2D results) directly in `folder`, if it exists."""
+    if not folder.is_dir():
+        return
+    for f in folder.glob("*.json"):
+        try:
+            f.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            raise RuntimeError(f"cannot remove the earlier 2D result {f}: {e}") from e
+
 
 @contextmanager
 def _in_dir(path: Path):
@@ -112,6 +129,11 @@ class Pipeline:
         if not videos:
             raise FileNotFoundError(f"no videos in {self.project.videos_dir}")
 
+        # Pose2Sim reads every *.json of every camNN_json folder: clear all cameras
+        # first, so a camera after a failed or cancelled one keeps no older results
+        for i in range(1, len(videos) + 1):
+            _remove_json(self.project.pose2d_cam_dir(i))
+
         for i, vid in enumerate(videos, start=1):
             out_dir = self.project.pose2d_cam_dir(i)
             self._log(f"[pose:{backend}] cam{i:02d} <- {vid.name}")
@@ -125,9 +147,16 @@ class Pipeline:
         on this computer or a usual place (logged); else the project setting, and the
         backend's availability check says where it looked."""
         from poseassess.core.openpose_setup import check_install, resolve_openpose_dir
-        root, how = resolve_openpose_dir(self.project.config.openpose_dir)
+        setting = self.project.config.openpose_dir or ""
+        root, how = resolve_openpose_dir(setting)
         if root is None:
-            return self.project.config.openpose_dir
+            return setting
+        if setting.strip().strip('"').strip() and how != _PROJECT_SETTING:
+            errors = check_install(setting).errors
+            self._log(f"[pose:openpose] warning: the OpenPose folder set on 1. Project "
+                      f"({setting}) is not usable: {errors[0] if errors else 'incomplete'}")
+        if how not in (_PROJECT_SETTING, _REMEMBERED):
+            how = "found in a usual place"
         self._log(f"[pose:openpose] OpenPose at {root} ({how})")
         for w in check_install(root).warnings:
             self._log(f"[pose:openpose] warning: {w}")

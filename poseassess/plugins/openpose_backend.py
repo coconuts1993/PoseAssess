@@ -9,11 +9,15 @@ as ``C:\\openpose`` (the folder with ``bin/OpenPoseDemo.exe`` and ``models/``).
 ``OpenPoseDemo.exe`` runs with the install root as working directory (it finds
 ``models/`` there) and writes one JSON per frame, ``<video stem>_<12-digit
 frame>_keypoints.json``, which is already the format the rest of the pipeline
-consumes; the files are renamed to ``frame_00000.json``, ... in frame order.
-OpenPose's output lines and the number of frames done go to `progress` while it
-runs. On Windows the process is put in a Job Object that kills it when the
-pipeline process ends, so Cancel (which terminates that process) also stops
-OpenPose instead of leaving it running on the GPU.
+consumes. It writes them into a work folder inside the camera folder
+(``camNN_json/.openpose_partial``, which Pose2Sim does not read); only after a
+successful run are they moved up as ``frame_00000.json``, ... in frame order. So a
+camera whose run failed or was cancelled has no JSON at all instead of a partial
+or stale mix. OpenPose's output lines (at most `_LINES_PER_WINDOW` a second) and
+the number of frames done go to `progress` while it runs. On Windows the process
+is put in a Job Object that kills it when the pipeline process ends, so Cancel
+(which terminates that process) also stops OpenPose instead of leaving it running
+on the GPU.
 """
 from __future__ import annotations
 
@@ -22,6 +26,7 @@ import locale
 import os
 import queue
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -38,6 +43,9 @@ NET_RESOLUTION = ops.NET_RESOLUTION      # "-1x480", CMU's setting for BODY_25B
 TAIL_LINES = 20        # output lines quoted when OpenPose fails
 _POLL_S = 0.25         # how often the loop wakes up when OpenPose prints nothing
 _REPORT_S = 1.0        # frame progress at most this often
+_LINES_WINDOW_S = 1.0  # OpenPose output lines passed to progress: at most
+_LINES_PER_WINDOW = 20  # this many per window, the rest are only counted
+_WORK_DIR = ".openpose_partial"  # inside the camera folder; no *.json at its level
 _KEYPOINTS_GLOB = "*_keypoints.json"
 _KEYPOINTS_RE = re.compile(r"_(\d+)_keypoints\.json$")
 
@@ -50,7 +58,12 @@ class OpenPoseBackend(Pose2DBackend):
     progress_throttled = True
 
     def resolve(self) -> tuple[Optional[Path], str]:
-        """(install root, where it came from); see `openpose_setup.resolve_openpose_dir`."""
+        """(install root, where it came from); see `openpose_setup.resolve_openpose_dir`.
+
+        Looks at several folders (C:\\openpose, D:\\openpose, which may be a slow or
+        removable drive, ...) and reads the prototxt, so the GUI must call it (and
+        `is_available`) in a worker thread.
+        """
         return ops.resolve_openpose_dir(self.options.get("openpose_dir"))
 
     def _model_pose(self) -> str:
@@ -60,6 +73,7 @@ class OpenPoseBackend(Pose2DBackend):
         return str(self.options.get("net_resolution") or NET_RESOLUTION)
 
     def is_available(self) -> tuple[bool, str]:
+        """(usable, why not); slow like `resolve`, so not on the GUI thread."""
         root, how = self.resolve()
         if root is None:
             return False, _not_found_message(how)
@@ -107,27 +121,41 @@ class OpenPoseBackend(Pose2DBackend):
         out = Path(output_dir).absolute()
         out.mkdir(parents=True, exist_ok=True)
         _remove_old_results(out)
+        work = out / _WORK_DIR
+        work.mkdir()
+        try:
+            written = self._run(exe, root, video, out, work, report, tag)
+        except BaseException:
+            # a failed camera is left empty, never half-filled (Pose2Sim reads every *.json)
+            _remove_old_results(out, strict=False)
+            raise
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+        return Pose2DResult(camera_index=camera_index, frames_written=written, output_dir=out)
 
-        video_arg, out_arg = _arg_path(video), _arg_path(out)
-        for p in (video_arg, out_arg):
+    def _run(self, exe: Path, root: Path, video: Path, out: Path, work: Path,
+             report: ProgressFn, tag: str) -> int:
+        """Run OpenPose on `video` into `work`, then move its JSON to `out`; frames written."""
+        video_arg, work_arg = _arg_path(video), _arg_path(work)
+        for p in (video_arg, work_arg):
             if not p.isascii():
                 report(0, None, f"{tag}: warning: OpenPose may fail to open paths with "
                                 f"non-ASCII characters ({p})")
-        total = _frame_count(video)
+        total = _frame_count(video_arg)  # the short path also helps OpenCV
         report(0, total, f"{tag}: OpenPose {self._model_pose()} {self._net_resolution()} "
                          f"on {video.name}" + (f" ({total} frames)" if total else ""))
-        code, tail = _run_openpose(self.command(exe, video_arg, out_arg), root, out,
+        code, tail = _run_openpose(self.command(exe, video_arg, work_arg), root, work,
                                    total, report, tag)
         output = "\n".join(tail) or "(no output)"
         if code != 0:
             raise RuntimeError(f"OpenPose failed ({_exit_text(code)}): {output}")
 
-        written = _rename_frames(out)
+        written = _move_frames(work, out)
         if written == 0:
             raise RuntimeError(f"OpenPose finished but wrote no keypoint files for {video.name} "
-                               f"into {out} (could it read the video?): {output}")
+                               f"(could it read the video?): {output}")
         report(written, total or written, f"{tag}: {written} frames")
-        return Pose2DResult(camera_index=camera_index, frames_written=written, output_dir=out)
+        return written
 
 
 # --------------------------------------------------------------------------- #
@@ -141,8 +169,11 @@ def _not_found_message(how: str) -> str:
     return f"OpenPose not found: set the OpenPose folder on 1. Project {detail}"
 
 
-def _remove_old_results(out: Path) -> None:
-    """Delete the JSON of an earlier run, so it is neither mixed in nor in the way."""
+def _remove_old_results(out: Path, *, strict: bool = True) -> None:
+    """Delete the JSON of an earlier or failed run and OpenPose's work folder (left by
+    a cancelled run), so nothing old is mixed in or in the way. `strict`: raise
+    RuntimeError when something cannot be removed; else leave it (cleanup after an
+    error, which must not hide that error)."""
     for pattern in (_KEYPOINTS_GLOB, "frame_*.json"):
         for f in out.glob(pattern):
             try:
@@ -150,7 +181,16 @@ def _remove_old_results(out: Path) -> None:
             except FileNotFoundError:
                 pass
             except OSError as e:
-                raise RuntimeError(f"cannot remove the earlier result {f}: {e}") from e
+                if strict:
+                    raise RuntimeError(f"cannot remove the earlier result {f}: {e}") from e
+    work = out / _WORK_DIR
+    try:
+        shutil.rmtree(work)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        if strict:
+            raise RuntimeError(f"cannot remove the earlier result {work}: {e}") from e
 
 
 def _frame_number(path: Path) -> Optional[int]:
@@ -158,19 +198,20 @@ def _frame_number(path: Path) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
-def _rename_frames(out: Path) -> int:
-    """Rename OpenPose's ``*_keypoints.json`` to ``frame_00000.json``, ... in frame order."""
+def _move_frames(src: Path, out: Path) -> int:
+    """Move OpenPose's ``*_keypoints.json`` from `src` to `out` as ``frame_00000.json``,
+    ... in frame order; returns how many."""
     def key(p: Path) -> tuple[bool, int, str]:
         n = _frame_number(p)
         return n is None, n or 0, p.name
 
-    files = sorted(out.glob(_KEYPOINTS_GLOB), key=key)
+    files = sorted(src.glob(_KEYPOINTS_GLOB), key=key)
     for i, f in enumerate(files):
         dest = out / f"frame_{i:05d}.json"
         try:
             f.replace(dest)  # replace, not rename: no FileExistsError on Windows
         except OSError as e:
-            raise RuntimeError(f"cannot rename {f} to {dest.name}: {e}") from e
+            raise RuntimeError(f"cannot move {f} to {dest}: {e}") from e
     return len(files)
 
 
@@ -182,7 +223,7 @@ def _count_keypoint_files(out: Path) -> int:
         return 0
 
 
-def _frame_count(video: Path) -> Optional[int]:
+def _frame_count(video: str | Path) -> Optional[int]:
     """Number of frames of `video` according to OpenCV, None when unknown."""
     try:
         import cv2
@@ -202,11 +243,32 @@ def _frames_text(tag: str, done: int, total: Optional[int]) -> str:
     return f"{tag}: {done} frames"
 
 
+# Windows status codes a crashed OpenPoseDemo.exe typically exits with
+_NTSTATUS_TEXT = {
+    0xC0000005: "access violation (crash)",
+    0xC000001D: "illegal instruction (crash)",
+    0xC000007B: "a DLL is not a 64-bit Windows DLL",
+    0xC0000135: "a DLL was not found",
+    0xC0000139: "a DLL lacks a needed function (wrong version)",
+    0xC0000142: "a DLL failed to initialize",
+    0xC0000409: "stack buffer overrun / abort (crash)",
+}
+
+
 def _exit_text(code: int) -> str:
-    """'exit N', plus the hex NTSTATUS of a Windows crash (e.g. 0xC0000135: DLL not found)."""
-    if code >= 0x80000000:
-        return f"exit {code} = 0x{code:08X}"
-    return f"exit {code}"
+    """'exit N' for OpenPose's exit code.
+
+    Windows reports exit codes as unsigned 32-bit numbers: OpenPose's own error
+    exit (``return -1`` after it caught an exception: missing model file, unreadable
+    video, out of GPU memory) arrives as 4294967295 and is shown as 'exit -1 =
+    0xFFFFFFFF'; a known crash code as e.g. 'exit 0xC0000135: a DLL was not found'.
+    """
+    if code < 0x80000000:
+        return f"exit {code}"
+    known = _NTSTATUS_TEXT.get(code)
+    if known:
+        return f"exit 0x{code:08X}: {known}"
+    return f"exit {code - 0x100000000} = 0x{code:08X}"
 
 
 @lru_cache(maxsize=1)
@@ -240,17 +302,27 @@ def _pump_lines(stream: IO[bytes], lines: queue.Queue) -> None:
         lines.put(None)
 
 
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
 def _popen_kwargs() -> dict:
     kwargs: dict = {"stdin": subprocess.DEVNULL, "stdout": subprocess.PIPE,
                     "stderr": subprocess.STDOUT}
-    if os.name == "nt":
+    if _is_windows():
         kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     return kwargs
 
 
-def _run_openpose(cmd: list[str], cwd: Path, out: Path, total: Optional[int],
+def _hidden_text(tag: str, hidden: int) -> str:
+    return f"{tag} OpenPose: ({hidden} more output line{'s' * (hidden != 1)} not shown)"
+
+
+def _run_openpose(cmd: list[str], cwd: Path, json_dir: Path, total: Optional[int],
                   report: ProgressFn, tag: str) -> tuple[int, list[str]]:
-    """Run OpenPose to the end, forwarding its output and progress; (exit code, last lines)."""
+    """Run OpenPose to the end, forwarding its output (at most `_LINES_PER_WINDOW`
+    lines per `_LINES_WINDOW_S`) and the number of JSON files in `json_dir` to
+    `report`; (exit code, last output lines, all of them counted)."""
     try:
         proc = subprocess.Popen(cmd, cwd=str(cwd), **_popen_kwargs())
     except OSError as e:
@@ -258,16 +330,21 @@ def _run_openpose(cmd: list[str], cwd: Path, out: Path, total: Optional[int],
     job = None
     tail: deque[str] = deque(maxlen=TAIL_LINES)
     try:
-        if os.name == "nt":
+        if _is_windows():
             try:
                 job = kill_with_parent(proc.pid)
             except OSError as e:
-                report(0, total, f"{tag}: warning: Cancel may not stop OpenPose ({e})")
+                # expected when OpenPose has already ended (e.g. a DLL missing): the
+                # real error follows from its exit code
+                if proc.poll() is None:
+                    report(0, total, f"{tag}: warning: Cancel may not stop OpenPose ({e})")
         lines: queue.Queue = queue.Queue()
         reader = threading.Thread(target=_pump_lines, args=(proc.stdout, lines),
                                   name="openpose-output", daemon=True)
         reader.start()
-        done, last_report = 0, time.monotonic()
+        done = 0
+        last_report = window = time.monotonic()
+        shown = hidden = 0
         while True:
             try:
                 line = lines.get(timeout=_POLL_S)
@@ -275,16 +352,26 @@ def _run_openpose(cmd: list[str], cwd: Path, out: Path, total: Optional[int],
                 line = ""
             if line is None:  # OpenPose closed its output: it has ended
                 break
+            now = time.monotonic()
+            if now - window >= _LINES_WINDOW_S:
+                if hidden:
+                    report(done, total, _hidden_text(tag, hidden))
+                window, shown, hidden = now, 0, 0
             if line:
                 tail.append(line)
-                report(done, total, f"{tag} OpenPose: {line}")
-            now = time.monotonic()
+                if shown < _LINES_PER_WINDOW:
+                    shown += 1
+                    report(done, total, f"{tag} OpenPose: {line}")
+                else:
+                    hidden += 1
             if now - last_report >= _REPORT_S:
                 last_report = now
-                n = _count_keypoint_files(out)
+                n = _count_keypoint_files(json_dir)
                 if n > done:
                     done = n
                     report(done, total, _frames_text(tag, done, total))
+        if hidden:
+            report(done, total, _hidden_text(tag, hidden))
         code = proc.wait()
         reader.join(timeout=5)
     finally:
@@ -421,7 +508,7 @@ def _arg_path(path: Path) -> str:
     on Windows a path with non-ASCII characters is replaced by its 8.3 short form
     when that is ASCII (short names may be disabled on a drive: then unchanged)."""
     s = str(path)
-    if s.isascii() or os.name != "nt":
+    if s.isascii() or not _is_windows():
         return s
     try:
         buf = ctypes.create_unicode_buffer(32768)
