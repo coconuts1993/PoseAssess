@@ -6,6 +6,7 @@ lines + per-stage results back to the GUI thread via signals.
 from __future__ import annotations
 
 import os
+import re
 import sys
 import time
 from typing import Optional
@@ -41,6 +42,11 @@ def _noop_figure(orig):
         k.pop("num", None)
         return orig(*a, **k)
     return _fig
+
+
+# Progress lines that may be throttled on the Run page: OpenSim IK "Frame 12 (t = ...)",
+# tqdm bars "... 45%|####", the plugin backends' "cam01: 120/600 frames (20%)".
+_PROGRESS_RE = re.compile(r"\d+%\||^\s*Frame\s+\d+|\d+/\d+ frames")
 
 
 class _LogStream:
@@ -136,6 +142,13 @@ class PipelineWorker(QObject):
 
         results: list[StageResult] = []
         last_emit = 0.0
+        pending: str | None = None  # last progress line held back by the throttle
+
+        def flush() -> None:
+            nonlocal pending
+            if pending is not None:
+                self.log.emit(pending)
+                pending = None
         try:
             self._proc = subprocess.Popen(
                 args, cwd=pkg_parent, env=env, stdout=subprocess.PIPE,
@@ -145,6 +158,8 @@ class PipelineWorker(QObject):
                 line = raw.rstrip()
                 if not line:
                     continue
+                if line.startswith("@@"):
+                    flush()  # the last progress state before the stage ends
                 if line.startswith("@@STAGE_START "):
                     self.log.emit(f"=== {line[len('@@STAGE_START '):]} ===")
                 elif line.startswith("@@STAGE_RESULT "):
@@ -155,12 +170,20 @@ class PipelineWorker(QObject):
                     self.stage_done.emit(res)
                 elif line.startswith("@@DONE"):
                     break
-                else:
-                    # throttle high-frequency progress (IK prints ~1 line/frame)
+                elif _PROGRESS_RE.search(line):
+                    # throttle high-frequency progress (IK prints ~1 line/frame); the
+                    # last held-back line is shown before the next message / marker
                     now = time.time()
                     if now - last_emit >= 0.15:
                         last_emit = now
+                        pending = None
                         self.log.emit(line)
+                    else:
+                        pending = line
+                else:
+                    flush()
+                    self.log.emit(line)  # messages (warnings, errors) are never dropped
+            flush()
             self._proc.wait()
             if self._cancel:
                 self.log.emit("[cancelled]")
