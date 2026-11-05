@@ -222,7 +222,8 @@ built-in RTMPose / MediaPipe models. It uses YOUR OWN OpenPose install.
 License: OpenPose (Carnegie Mellon University) may be used for academic or
 non-profit NONCOMMERCIAL RESEARCH only and must not be redistributed, so it
 is NOT included in this package. Never add it to a copy of PoseAssess that
-leaves your organization, and never upload it (lab PCs: see below).
+leaves your organization, and never upload it (lab PCs: see INTERNAL LAB
+PACKAGE WITH OPENPOSE below).
 License text:
 https://github.com/CMU-Perceptual-Computing-Lab/openpose/blob/master/LICENSE
 
@@ -240,16 +241,19 @@ Requirements:
 
 Setup:
 1. Put OpenPose in C:\openpose (the folder with bin\OpenPoseDemo.exe and
-   models\): PoseAssess finds it there by itself (also D:\openpose,
-   %USERPROFILE%\openpose and the last folder used on this PC). Anywhere
-   else: enter the folder under "OpenPose folder" on 1. Project, or use
-   Browse... next to it. Avoid non-ASCII characters in the path.
+   models\): PoseAssess finds it there by itself. It also looks in
+   <PoseAssess folder>\openpose (next to run.bat: the lab's internal
+   package puts it there), D:\openpose, %USERPROFILE%\openpose and the
+   last folder used on this PC. Anywhere else: enter the folder under
+   "OpenPose folder" on 1. Project, or use Browse... next to it. Avoid
+   non-ASCII characters in the path.
    Or: 1. Project > "Get OpenPose..." > tick the license box > "Download
    official OpenPose 1.7.0 (418 MB)...": it downloads CMU's official release
    from GitHub onto this PC and unpacks it into <chosen folder>\openpose
    (choose C:\ to get C:\openpose; about 1.5 GB of free disk space needed).
-   The bar shows the download, then "Unpacking..."; Cancel (or closing the
-   window) stops it and removes the partial files.
+   The bar shows the download; then the line under it says "Unpacking...".
+   Cancel (or closing the window) stops it and removes the partial files
+   (if you quit PoseAssess right after, it finishes that before it ends).
 2. The BODY_25B files must have EXACTLY these names:
        models\pose\body_25b\pose_deploy.prototxt
        models\pose\body_25b\pose_iter_XXXXXX.caffemodel
@@ -268,17 +272,54 @@ Setup:
    The line under "OpenPose folder" should say "OpenPose ready: ..." in
    green. If no usable OpenPose is found, the field is framed in amber and
    the line says "Enter the OpenPose folder (e.g. C:\openpose) or use Get
-   OpenPose...", with what is missing and how to fix it. The line also
-   warns about an unsupported GPU / driver.
+   OpenPose...", with what is missing and how to fix it. If the folder you
+   entered is incomplete but another OpenPose (e.g. C:\openpose) is ready,
+   the line says so: "... is not ready (...); using C:\openpose instead".
+   The line also warns about an unsupported GPU / driver.
    A folder that checks OK is remembered on this PC for every project.
 
-Lab PCs: use the INTERNAL package made with pack_with_openpose.bat (see the
-pack_with_openpose.bat section): PoseAssess together with the lab's own
-OpenPose, kept on the lab's shared drive. Never upload that package or pass
-it on outside the lab. The license allows such copies only inside your
-organization: "If Licensee is an organization, it may make that number of
-copies of the Software necessary for internal noncommercial use at a single
-site within its organization provided that all information appearing in or
-on the original labels, including the copyright and trademark notices are
-copied onto the labels of the copies." Never pass OpenPose (or its model
-files) on to anyone outside your organization / site.
+Lab PCs: use the INTERNAL package made with pack_with_openpose.bat (see
+INTERNAL LAB PACKAGE WITH OPENPOSE below): PoseAssess together with the
+lab's own OpenPose, kept on the lab's shared drive. Never upload that
+package or pass it on outside the lab. The license allows such copies only
+inside your organization: "If Licensee is an organization, it may make that
+number of copies of the Software necessary for internal noncommercial use at
+a single site within its organization provided that all information
+appearing in or on the original labels, including the copyright and
+trademark notices are copied onto the labels of the copies." Never pass
+OpenPose (or its model files) on to anyone outside your organization / site.
+
+INTERNAL LAB PACKAGE WITH OPENPOSE (pack_with_openpose.bat)
+-----------------------------------------------------------
+Makes a copy of this PoseAssess folder WITH the lab's OpenPose inside, for
+the lab's other PCs. It is for internal noncommercial use at your site only
+(OpenPose license, see above): keep it on the lab's shared drive, NEVER
+upload or publish it.
+
+1. On a PC where OpenPose works (1. Project says "OpenPose ready"),
+   double-click  pack_with_openpose.bat  in the PoseAssess folder. It finds
+   that OpenPose like PoseAssess does (e.g. C:\openpose), checks it, shows
+   the license note and asks before it copies anything.
+2. It copies only what BODY_25B needs into <PoseAssess folder>\openpose:
+   bin\ (all of it), models\pose\body_25b\pose_deploy.prototxt,
+   models\pose\body_25b\pose_iter_XXXXXX.caffemodel and CMU's license /
+   readme files (no other models). An existing openpose folder there is
+   replaced only after you confirm.
+3. It zips PoseAssess's own files (python311\, venv\, poseassess\,
+   models\, openpose\, docs\, the .bat files, readme and requirement
+   lists) to  ..\<this folder's name>_with_OpenPose.zip  (next to this
+   folder). Anything else in the folder, e.g. recordings\ of run_wii.bat
+   (participant data), is left out and listed. Put the zip on the lab's
+   shared drive.
+4. On a lab PC: unzip it to the local disk and double-click run.bat. The
+   openpose folder next to run.bat is found automatically; choose
+   "OpenPose · BODY_25B (GPU)" on 1. Project. The PC still needs an NVIDIA
+   GPU and driver as listed under Requirements above.
+Options (from a console in the PoseAssess folder):
+    pack_with_openpose.bat --src "D:\tools\openpose"   (another OpenPose)
+    pack_with_openpose.bat --no-zip                     (only the copy)
+    pack_with_openpose.bat --zip-path "S:\Lab\PoseAssess"   (zip elsewhere)
+    pack_with_openpose.bat --help
+"Get OpenPose..." never downloads into the PoseAssess folder (a copy of
+PoseAssess must not carry OpenPose by accident); only this tool puts it
+there, on purpose, for the internal package.

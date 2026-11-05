@@ -31,6 +31,7 @@ from ..widgets.openpose_dialog import (
     WARN,
     OpenPoseDialog,
     OpenPoseReport,
+    clean_setting,
     openpose_report,
     status_html,
     stop_jobs,
@@ -53,6 +54,34 @@ class _CheckBridge(QObject):
     gpu = Signal(object)           # list[str] (gpu_warnings)
 
 
+class BackendCombo(QComboBox):
+    """Combo box that tells a choice made in its popup list (`chosen_in_popup`) from a
+    change with the arrow keys or the mouse wheel on the closed box: Qt emits `activated`
+    for all of them, and only a choice in the list may move the keyboard focus (an arrow
+    key press must stay in the box, a wheel turn over it is often meant for the page)."""
+    chosen_in_popup = Signal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._closing_popup = False
+        self.activated.connect(self._on_activated)
+
+    def hidePopup(self) -> None:
+        # a click or Enter in the list calls hidePopup() and then emits activated
+        self._closing_popup = True
+        QTimer.singleShot(0, self._popup_closed)
+        super().hidePopup()
+
+    def _popup_closed(self) -> None:
+        self._closing_popup = False
+
+    def _on_activated(self, index: int) -> None:
+        in_popup = self._closing_popup or self.view().isVisible()
+        self._closing_popup = False
+        if in_popup:
+            self.chosen_in_popup.emit(index)
+
+
 class ProjectPage(BasePage):
     nav_title = "1. Project"
     needs_project = False
@@ -66,6 +95,8 @@ class ProjectPage(BasePage):
         self._gpu_warnings: list[str] | None = None   # checked once (runs nvidia-smi)
         self._gpu_check_started = False
         self._focus_if_missing = False   # the user just chose OpenPose in the combo box
+        self._remember_on_check: str | None = None   # saved folder to remember once checked
+        self._dialog: OpenPoseDialog | None = None    # "Get OpenPose…" while open
         self._bridge = _CheckBridge()
         self._bridge.report.connect(self._on_openpose_report)
         self._bridge.gpu.connect(self._on_gpu_checked)
@@ -104,7 +135,7 @@ class ProjectPage(BasePage):
         self.name_edit = QLineEdit()
         self.cameras_spin = QSpinBox(); self.cameras_spin.setRange(1, 32); self.cameras_spin.setValue(6)
         self.fps_spin = QSpinBox(); self.fps_spin.setRange(1, 1000); self.fps_spin.setValue(60)
-        self.backend_combo = QComboBox()
+        self.backend_combo = BackendCombo()
         from poseassess.core.pose_backends import POSE_BACKENDS
         for name, spec in POSE_BACKENDS.items():
             self.backend_combo.addItem(spec.display, name)
@@ -140,7 +171,7 @@ class ProjectPage(BasePage):
 
         self.settings_box.setEnabled(False)
         self.backend_combo.currentIndexChanged.connect(self._update_openpose_row)
-        self.backend_combo.activated.connect(self._on_backend_activated)  # user choice only
+        self.backend_combo.chosen_in_popup.connect(self._on_backend_activated)  # user choice
         self._update_openpose_row()
 
     def _build_openpose_row(self) -> QWidget:
@@ -203,8 +234,8 @@ class ProjectPage(BasePage):
             self._check_openpose()
 
     def _on_backend_activated(self, _index: int) -> None:
-        """The user chose a backend: for OpenPose without a usable install, put the keyboard
-        focus into the folder field (once the check of the folder says so)."""
+        """The user chose a backend in the list: for OpenPose without a usable install, put
+        the keyboard focus into the folder field (once the check of the folder says so)."""
         self._focus_if_missing = self._openpose_shown()
         if self._focus_if_missing and not self.openpose_check_pending():
             self._apply_missing_focus()
@@ -243,6 +274,11 @@ class ProjectPage(BasePage):
         self._report_seq = seq
         self._op_report = report
         self._show_openpose_status()
+        if self._remember_on_check is not None and report.setting == self._remember_on_check:
+            self._remember_on_check = None
+            self._remember_checked(report)
+        if self._dialog is not None and not self.openpose_check_pending():
+            self._dialog.offer_status(self._dialog_status(report))
         if not self.openpose_check_pending():
             self._apply_missing_focus()
 
@@ -301,14 +337,35 @@ class ProjectPage(BasePage):
         return self._check_timer.isActive() or self._report_seq != self._check_seq
 
     def _openpose_setting(self) -> str:
-        return self.openpose_edit.text().strip().strip('"').strip()
+        return clean_setting(self.openpose_edit.text())
+
+    def _current_report(self) -> OpenPoseReport | None:
+        """Result of the check of the current folder text (None while it runs)."""
+        report = self._op_report
+        if (report is None or self.openpose_check_pending()
+                or report.setting != self._openpose_setting()):
+            return None
+        return report
 
     def _remember_openpose(self, setting: str) -> None:
-        """Remember a working OpenPose folder on this computer (for every project)."""
-        if setting:
-            st = ops.check_install(setting)
-            if st.ok:
-                ops.remember_dir(st.root)
+        """Remember a working OpenPose folder on this computer (for every project) once it
+        checks OK. Uses the background check (no file access here: the folder may be on a
+        slow or disconnected drive); still running: remembered when it ends."""
+        self._remember_on_check = None
+        if not setting:
+            return
+        report = self._current_report()
+        if report is not None and report.setting == setting:
+            self._remember_checked(report)
+            return
+        self._remember_on_check = setting
+        self._check_openpose()   # now; replaces a check that may be of an older text
+
+    @staticmethod
+    def _remember_checked(report: OpenPoseReport) -> None:
+        st = report.typed_status
+        if st is not None and st.ok and st.root is not None:
+            ops.remember_dir(st.root)
 
     def _known_openpose_root(self) -> Path | None:
         """Install found by the last check (None before it / when none was found)."""
@@ -322,9 +379,22 @@ class ProjectPage(BasePage):
             self.openpose_edit.setText(str(root or Path(d)))
             self._check_openpose()   # now, not after the typing delay
 
+    def _dialog_status(self, report: OpenPoseReport):
+        """Install the dialog starts with: the folder entered (to complete it), else the
+        auto-detected one."""
+        return report.typed_status if report.setting else report.status
+
     def _get_openpose(self):
-        dlg = OpenPoseDialog(self, self._openpose_setting() or self._known_openpose_root())
-        dlg.exec()
+        if self._check_timer.isActive():
+            self._check_openpose()
+        report = self._current_report()
+        # known from the background check; still running: offered to the dialog when done
+        dlg = OpenPoseDialog(self, status=self._dialog_status(report) if report else None)
+        self._dialog = dlg
+        try:
+            dlg.exec()
+        finally:
+            self._dialog = None
         picked = dlg.result_root()
         dlg.deleteLater()
         if picked is not None and str(picked) != self._openpose_setting():
@@ -426,4 +496,6 @@ class ProjectPage(BasePage):
 
     def shutdown(self) -> None:
         self._check_timer.stop()
-        stop_jobs()  # OpenPose downloads cancelled by closing their dialog
+        # OpenPose downloads cancelled by closing their dialog: told to stop now; waited for
+        # at exit, after the window has gone (they remove their partial files)
+        stop_jobs()

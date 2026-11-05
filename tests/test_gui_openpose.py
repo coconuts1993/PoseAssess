@@ -6,6 +6,10 @@ import dataclasses
 import functools
 import hashlib
 import io
+import os
+import subprocess
+import sys
+import textwrap
 import threading
 import time
 from pathlib import Path
@@ -88,10 +92,17 @@ def select_backend(page, name: str) -> None:
 
 
 def user_selects(page, name: str) -> None:
-    """Like a choice in the combo box popup: currentIndexChanged, then activated."""
-    i = page.backend_combo.findData(name)
-    page.backend_combo.setCurrentIndex(i)
-    page.backend_combo.activated.emit(i)
+    """A choice in the combo box's popup list (opened, item made current, Enter): Qt's
+    own path, currentIndexChanged then activated."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    combo = page.backend_combo
+    combo.showPopup()
+    view = combo.view()
+    view.setCurrentIndex(combo.model().index(combo.findData(name), 0))
+    QTest.keyClick(view, Qt.Key_Return)
+    assert combo.currentData() == name and not view.isVisible()
 
 
 def wait_report(page, text: str, timeout: float = 5.0) -> str:
@@ -190,6 +201,8 @@ def test_gpu_warnings_checked_once_off_the_gui_thread(page, monkeypatch):
 
     monkeypatch.setattr(ops, "gpu_info", fake_gpu_info)
     select_backend(page, "openpose")
+    # the GPU and the folder checks run in two threads: either may end first
+    assert pump_until(lambda: "RTX 50 series" in plain(page.openpose_status))
     line = wait_report(page, "RTX 50 series")
     assert line.count("GPU: ") == 1
     select_backend(page, "rtmpose")
@@ -200,30 +213,69 @@ def test_gpu_warnings_checked_once_off_the_gui_thread(page, monkeypatch):
     assert "RTX 50 series" in plain(page.openpose_status)
 
 
-def test_save_stores_and_remembers_the_folder(page, project, tmp_path, prototxts):
+def _record_file_checks(monkeypatch) -> list:
+    """Records the thread of every find_root / check_install call."""
+    seen = []
+    for name in ("find_root", "check_install"):
+        real = getattr(ops, name)
+
+        def spy(*a, _real=real, _name=name, **k):
+            seen.append((_name, threading.current_thread()))
+            return _real(*a, **k)
+        monkeypatch.setattr(ops, name, spy)
+    return seen
+
+
+def test_save_stores_and_remembers_the_folder(page, project, tmp_path, prototxts, monkeypatch):
     from poseassess.core.project import Project
 
     root = make_install(tmp_path / "op" / "openpose", prototxt=prototxts["1_25BBkg"])
     page.state.set_project(project)
     select_backend(page, "openpose")
+    seen = _record_file_checks(monkeypatch)
     page.openpose_edit.setText(f"  {root}  ")
-    page._save()
+    page._save()                                  # while the folder check still runs
     cfg = Project.load(project.root).config
     assert cfg.openpose_dir == str(root) and cfg.pose2d_backend == "openpose"
-    assert ops.remembered_dir() == root
+    assert pump_until(lambda: ops.remembered_dir() == root)   # once the check said OK
     assert ops.user_settings_path().parent == tmp_path / "cfg"
+
+    # checked already: remembered at once from that result
+    ops.user_settings_path().unlink()
+    assert ops.remembered_dir() is None and not page.openpose_check_pending()
+    page._save()
+    assert ops.remembered_dir() == root
+    assert seen and all(t is not threading.main_thread() for _, t in seen)   # no file access
 
     # a folder that does not check OK is saved, but not remembered
     bad = make_install(tmp_path / "bad", caffemodel=None)
     page.openpose_edit.setText(str(bad))
     page._save()
     assert Project.load(project.root).config.openpose_dir == str(bad)
+    line = wait_report(page, f"{bad} is not ready")   # the run uses the remembered one
+    assert f"using {root} instead (remembered on this computer)" in line
+    pump(0.05)
     assert ops.remembered_dir() == root
 
     # empty = auto-detect
     page.openpose_edit.setText("")
     page._save()
     assert Project.load(project.root).config.openpose_dir == ""
+    assert all(t is not threading.main_thread() for _, t in seen)
+
+
+def test_save_with_another_backend_remembers_after_a_check(page, project, tmp_path,
+                                                           prototxts):
+    """The row is hidden (no checks while typing): Save checks the folder in the background."""
+    root = make_install(tmp_path / "op" / "openpose", prototxt=prototxts["1_25BBkg"])
+    page.state.set_project(project)
+    select_backend(page, "rtmpose")
+    page.openpose_edit.setText(str(root))
+    pump(0.4)
+    assert page.openpose_ok is None              # nothing checked while hidden
+    page._save()
+    assert pump_until(lambda: ops.remembered_dir() == root)
+    assert not highlighted(page)
 
 
 def test_create_stores_the_folder(page, tmp_path, prototxts):
@@ -235,7 +287,7 @@ def test_create_stores_the_folder(page, tmp_path, prototxts):
     page.openpose_edit.setText(str(root))
     page._create()
     assert Project.load(tmp_path / "newproj").config.openpose_dir == str(root)
-    assert ops.remembered_dir() == root
+    assert pump_until(lambda: ops.remembered_dir() == root)
 
 
 def test_loading_a_project_fills_the_field(page, project):
@@ -268,6 +320,42 @@ def test_get_openpose_puts_the_chosen_root_into_the_field(page, tmp_path, monkey
     assert page.openpose_edit.text() == str(root) and seen["start"] is None
 
 
+def test_get_openpose_starts_from_the_checked_folder(page, tmp_path, monkeypatch, prototxts):
+    """The dialog gets the page's background check: opening it touches no drive on the GUI
+    thread; a check still running when it opens is passed on when it ends."""
+    from poseassess.gui.widgets import openpose_dialog as dlg_mod
+
+    bad = make_install(tmp_path / "bad" / "openpose",
+                       prototxt=prototxts["1_25BSuperModel11FullVGG"], caffemodel=None)
+    seen = {}
+
+    def fake_exec(self):
+        seen["root"], seen["status"] = self._root, plain(self.status)
+        seen["variant"] = self.variant_combo.currentData()
+        pump_until(lambda: self._root is not None, 5.0)   # a check still running ends
+        seen["later"] = self._root
+        return 0
+
+    monkeypatch.setattr(dlg_mod.OpenPoseDialog, "exec", fake_exec)
+    select_backend(page, "openpose")
+    page.openpose_edit.setText(str(bad))
+    wait_report(page, "OpenPose not ready")
+    checks = _record_file_checks(monkeypatch)
+    page._get_openpose()
+    assert seen["root"] == bad and "missing BODY_25B weights" in seen["status"]
+    assert seen["variant"] == "1_25BSuperModel11FullVGG"
+    # nothing checked on the GUI thread (the page re-checks in the background afterwards)
+    assert all(t is not threading.main_thread() for _, t in checks)
+    assert page._dialog is None
+
+    # typed and clicked at once: the dialog opens empty and gets the result when it comes
+    page.openpose_edit.setText(str(bad.parent))
+    assert page.openpose_check_pending()
+    page._get_openpose()
+    assert seen["root"] is None and seen["later"] == bad
+    assert all(t is not threading.main_thread() for _, t in checks)
+
+
 def test_report_fix_hints(tmp_path, prototxts):
     from poseassess.gui.widgets.openpose_dialog import ENTER_FOLDER, openpose_report
 
@@ -291,6 +379,29 @@ def test_report_fix_hints(tmp_path, prototxts):
     (root / "bin" / "cudart64_110.dll").write_bytes(b"MZ")
     report = openpose_report(str(root))
     assert report.ok and report.root == root and ENTER_FOLDER not in str(report.lines)
+    assert report.typed_root == root and report.typed_status.ok and report.setting == str(root)
+
+
+def test_report_says_when_the_entered_folder_is_not_used(tmp_path, monkeypatch, prototxts):
+    """The folder entered has OpenPoseDemo.exe but is incomplete, another install is ready:
+    the run uses the other one, and the status line says so (in amber)."""
+    from poseassess.gui.widgets.openpose_dialog import GOOD, WARN, openpose_report
+
+    good = make_install(tmp_path / "C" / "openpose", prototxt=prototxts["1_25BBkg"])
+    typed = make_install(tmp_path / "D" / "openpose", prototxt=prototxts["1_25BBkg"],
+                         caffemodel=None)
+    monkeypatch.setattr(ops, "candidate_dirs", lambda: [good])
+    report = openpose_report(str(typed))
+    assert report.ok and report.root == good
+    assert report.typed_root == typed and not report.typed_status.ok
+    (note, colour), (summary, colour2) = report.lines[:2]
+    assert colour == WARN and note.startswith(f"{typed} is not ready (missing BODY_25B weights")
+    assert note.endswith(f"; using {good} instead (auto-detected)")
+    assert summary.startswith(f"OpenPose ready: {good}") and colour2 == GOOD
+
+    # the parent folder of an incomplete install: same
+    report = openpose_report(str(typed.parent))
+    assert report.lines[0][0].startswith(f"{typed} is not ready")
 
 
 def test_missing_install_highlights_the_field(page, tmp_path, prototxts, monkeypatch):
@@ -415,8 +526,52 @@ def test_choosing_openpose_without_install_focuses_the_field(shown_page):
 
     # choosing it again (already selected) focuses at once
     page.backend_combo.setFocus()
-    page.backend_combo.activated.emit(page.backend_combo.currentIndex())
+    user_selects(page, "openpose")
     assert page.window().focusWidget() is page.openpose_edit
+
+
+def test_arrow_keys_and_wheel_on_the_closed_box_keep_the_focus(shown_page):
+    """Qt emits `activated` for arrow keys and wheel turns on the closed combo box too: the
+    focus must stay in the box (Up must still go back), only a choice in the list moves it."""
+    from PySide6.QtCore import QPoint, QPointF, Qt
+    from PySide6.QtGui import QWheelEvent
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QApplication
+
+    page = shown_page
+    combo = page.backend_combo
+    before = combo.count() - 2
+    assert combo.itemData(combo.count() - 1) == "openpose"    # the last item
+    combo.setCurrentIndex(before)
+    wait_report(page, "")
+    QTest.keyClick(combo, Qt.Key_Down)
+    assert combo.currentData() == "openpose"
+    wait_report(page, "Enter the OpenPose folder")
+    pump(0.1)
+    assert page.window().focusWidget() is combo and highlighted(page)
+    QTest.keyClick(page.window().focusWidget(), Qt.Key_Up)    # back again
+    assert combo.currentIndex() == before
+    QTest.keyClick(combo, Qt.Key_Down)
+    wait_report(page, "Enter the OpenPose folder")
+
+    combo.setCurrentIndex(before)
+    pump(0.05)
+    wheel = QWheelEvent(QPointF(5, 5), QPointF(combo.mapToGlobal(QPoint(5, 5))), QPoint(0, 0),
+                        QPoint(0, -120), Qt.NoButton, Qt.NoModifier, Qt.NoScrollPhase, False)
+    QApplication.sendEvent(combo, wheel)
+    assert combo.currentData() == "openpose"
+    wait_report(page, "Enter the OpenPose folder")
+    pump(0.1)
+    assert page.window().focusWidget() is combo
+
+    # the popup closed with Esc, then an arrow key: still no focus change
+    combo.setCurrentIndex(before)
+    combo.showPopup()
+    QTest.keyClick(combo.view(), Qt.Key_Escape)
+    QTest.keyClick(combo, Qt.Key_Down)
+    wait_report(page, "Enter the OpenPose folder")
+    pump(0.1)
+    assert combo.currentData() == "openpose" and page.window().focusWidget() is combo
 
 
 def test_choosing_openpose_with_an_install_keeps_the_focus(shown_page, tmp_path, monkeypatch,
@@ -799,7 +954,7 @@ def test_download_shows_unpacking(dialog_factory, tmp_path, monkeypatch, no_mess
     d.accept_box.setChecked(True)
     d.b_download.click()
     assert pump_until(lambda: "Unpacking…" in plain(d.status), 5.0)
-    assert d.progress.format() == "Unpacking…" and d.progress.maximum() == 0   # busy bar
+    assert d.progress.maximum() == 0 and not d.progress.isHidden()   # busy bar (no text)
     assert d.b_cancel.isEnabled() and not d.b_cancel.isHidden()   # still cancellable
     assert not d.b_download.isEnabled() and not d.b_existing.isEnabled()
     release.set()
@@ -828,3 +983,134 @@ def test_dialog_license_summary_and_link(dialog_factory):
     assert intro.openExternalLinks()
     assert "license" in d.accept_box.text() and not d.accept_box.isChecked()
     assert "No OpenPose folder chosen yet" in plain(d.status)
+
+
+def test_closing_while_the_download_ends_in_the_question(dialog_factory, tmp_path, monkeypatch,
+                                                         no_message_boxes):
+    """'Stop the OpenPose download?' runs an event loop: the download (here: the unpacking)
+    may end before the user answers Yes. The dialog then just closes, with the result."""
+    from poseassess.gui.widgets import openpose_dialog as dlg_mod
+
+    release = threading.Event()
+
+    def download(dest_parent, *, progress=None, cancelled=None, **kw):
+        progress(ops.OFFICIAL_ZIP_SIZE, ops.OFFICIAL_ZIP_SIZE)   # "Unpacking…"
+        release.wait(5)
+        return make_install(Path(dest_parent) / "openpose")
+
+    monkeypatch.setattr(ops, "download_openpose", download)
+    monkeypatch.setattr(dlg_mod.QFileDialog, "getExistingDirectory",
+                        staticmethod(lambda *a, **k: str(tmp_path / "dl")))
+    box = dlg_mod.QMessageBox
+
+    def question(parent, title, text, *a):
+        no_message_boxes.append(("question", title, text))
+        release.set()                            # unpacking ends while the box is open
+        assert pump_until(lambda: not d.busy(), 5.0)
+        return box.Yes
+
+    monkeypatch.setattr(box, "question", staticmethod(question))
+    orphans = len(dlg_mod._ORPHANS)
+    d = dialog_factory()
+    d.show()
+    d.accept_box.setChecked(True)
+    d.b_download.click()
+    assert pump_until(lambda: "Unpacking…" in plain(d.status), 5.0)
+    d.reject()
+    assert not d.isVisible() and not d.busy()
+    assert d.result_root() == tmp_path / "dl" / "openpose"
+    assert len(dlg_mod._ORPHANS) == orphans      # nothing left running
+    assert [c[0] for c in no_message_boxes] == ["question"]
+
+
+def test_shutdown_does_not_wait_for_a_stopping_download(dialog_factory, tmp_path, monkeypatch,
+                                                         no_message_boxes):
+    """App close while a cancelled download still cleans up: the window does not freeze."""
+    from poseassess.gui.widgets import openpose_dialog as dlg_mod
+
+    release = threading.Event()
+
+    def download(dest_parent, *, progress=None, cancelled=None, **kw):
+        progress(1, 10)
+        release.wait(5)                          # e.g. a stalled read
+        raise RuntimeError("OpenPose download cancelled")
+
+    monkeypatch.setattr(ops, "download_openpose", download)
+    monkeypatch.setattr(dlg_mod.QFileDialog, "getExistingDirectory",
+                        staticmethod(lambda *a, **k: str(tmp_path / "dl")))
+    d = dialog_factory()
+    d.accept_box.setChecked(True)
+    d.b_download.click()
+    pump(0.05)
+    d.reject()
+    thread, job = dlg_mod._ORPHANS[-1]
+    assert dlg_mod.jobs_running() and job.cancelled()
+    t0 = time.perf_counter()
+    dlg_mod.stop_jobs()
+    assert time.perf_counter() - t0 < 0.5 and thread.isRunning()
+    release.set()
+    assert pump_until(lambda: not dlg_mod.jobs_running(), 5.0)
+    assert thread not in [t for t, _ in dlg_mod._ORPHANS]
+
+
+EXIT_SCRIPT = """
+import os, sys, threading, time
+from pathlib import Path
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
+from PySide6.QtWidgets import QApplication
+from poseassess.core import openpose_setup as ops
+from poseassess.gui.widgets import openpose_dialog as dm
+
+marker = Path(sys.argv[1])
+
+def slow_download(parent, *, progress=None, cancelled=None, **kw):
+    progress(1, 10)
+    try:
+        while not cancelled():
+            time.sleep(0.01)
+        time.sleep(1.5)          # e.g. one big file of the archive still being unpacked
+        raise RuntimeError("OpenPose download cancelled")
+    finally:
+        marker.write_text("partial files removed")
+
+class Box:
+    Yes, No = dm.QMessageBox.Yes, dm.QMessageBox.No
+    @staticmethod
+    def question(*a, **k):
+        return Box.Yes
+
+def main():
+    app = QApplication([])
+    ops.download_openpose = slow_download
+    dm.QMessageBox = Box
+    dm.QFileDialog.getExistingDirectory = staticmethod(lambda *a, **k: str(marker.parent))
+    d = dm.OpenPoseDialog(None)
+    d.accept_box.setChecked(True)
+    d.b_download.click()
+    end = time.time() + 0.3
+    while time.time() < end:
+        app.processEvents()
+        time.sleep(0.01)
+    d.reject()                   # cancels; the download is still stopping
+    dm.stop_jobs()               # ProjectPage.shutdown()
+    print("running at exit:", dm._ORPHANS[-1][0].isRunning(), flush=True)
+    return 0
+
+sys.exit(main())
+"""
+
+
+def test_exit_waits_for_a_stopping_download(tmp_path):
+    """Python exit with a cancelled download still stopping: it may finish (its cleanup
+    runs) and the process ends normally; Qt aborts when a running QThread is deleted."""
+    marker = tmp_path / "cleanup.txt"
+    root = Path(__file__).resolve().parents[1]
+    env = {**os.environ, "PYTHONPATH": str(root),
+           "POSEASSESS_CONFIG_DIR": str(tmp_path / "cfg"), "QT_QPA_PLATFORM": "offscreen"}
+    proc = subprocess.run([sys.executable, "-c", textwrap.dedent(EXIT_SCRIPT), str(marker)],
+                          cwd=tmp_path, env=env, capture_output=True, text=True, timeout=60)
+    assert "running at exit: True" in proc.stdout, proc.stdout + proc.stderr
+    assert proc.returncode == 0, proc.stderr
+    assert "Destroyed while thread" not in proc.stderr
+    assert "Stopping the cancelled OpenPose download" in proc.stderr
+    assert marker.read_text() == "partial files removed"

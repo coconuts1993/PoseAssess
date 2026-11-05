@@ -16,8 +16,11 @@ Also holds the status helpers shared with the project page (`openpose_report`,
 """
 from __future__ import annotations
 
+import atexit
 import html
+import logging
 import os
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -43,6 +46,8 @@ from PySide6.QtWidgets import (
 
 from poseassess.core import openpose_setup as ops
 
+log = logging.getLogger(__name__)
+
 GOOD, WARN, MUTED = "#3ad35a", "#e0a94c", "#8a8f98"
 #: Status line of "1. Project" when no usable OpenPose install is found.
 ENTER_FOLDER = "Enter the OpenPose folder (e.g. C:\\openpose) or use Get OpenPose…"
@@ -52,6 +57,11 @@ DOWNLOAD_MB = round(ops.OFFICIAL_ZIP_SIZE / 2**20)
 #: (QThread, worker) of downloads still running after their dialog was closed (they were
 #: cancelled); kept alive until they end, Python must never destroy a running QThread.
 _ORPHANS: list[tuple[QThread, QObject]] = []
+#: At exit: longest wait for cancelled downloads to stop and remove their partial files. A
+#: cancel takes effect at the next 64 KB read (a stalled one ends after the 60 s socket
+#: timeout) or the next file of the archive while unpacking.
+EXIT_WAIT_S = 150
+_exit_wait_registered = False
 
 INTRO_HTML = f"""
 <p><b>OpenPose · BODY_25B</b> runs from your own OpenPose installation on this PC.
@@ -115,12 +125,22 @@ def fix_hint(st: ops.InstallStatus) -> str | None:
     return None
 
 
+def clean_setting(text: str | None) -> str:
+    """The folder setting as stored and checked: no blanks, no quotes of Explorer's
+    "Copy as path"."""
+    return (text or "").strip().strip('"').strip()
+
+
 @dataclass
 class OpenPoseReport:
     """The OpenPose install a run would use (`openpose_report`)."""
     ok: bool
     root: Path | None
     lines: list[tuple[str, str]] = field(default_factory=list)   # (text, colour)
+    setting: str = ""                            # the folder setting checked (`clean_setting`)
+    status: ops.InstallStatus | None = None      # check of `root`
+    typed_root: Path | None = None               # install in the folder setting itself
+    typed_status: ops.InstallStatus | None = None   # check of `typed_root`
 
 
 def _origin_note(origin: str) -> str:
@@ -135,17 +155,23 @@ def openpose_report(setting: str) -> OpenPoseReport:
     off the GUI thread. Not ok (no install found, or the one found is incomplete): the
     lines end with `ENTER_FOLDER`.
     """
-    text = (setting or "").strip().strip('"').strip()
+    text = clean_setting(setting)
     root, origin = ops.resolve_openpose_dir(text)
     if root is None:
         where = ((f"{ops.EXE_NAME} not found in {text}", WARN) if text
                  else (origin, MUTED))   # where auto-detect looked
-        return OpenPoseReport(False, None, [(ENTER_FOLDER, WARN), where])
+        return OpenPoseReport(False, None, [(ENTER_FOLDER, WARN), where], setting=text)
+    typed = ops.find_root(text) if text else None
+    typed_st = ops.check_install(typed) if typed is not None else None
     lines: list[tuple[str, str]] = []
-    if text and ops.find_root(text) is None:
-        lines.append((f"{ops.EXE_NAME} not found in {text}; using {root} instead "
-                      f"({_origin_note(origin)})", WARN))
-    st = ops.check_install(root)
+    if text and typed != root:   # the run uses another install than the folder entered
+        if typed is None:
+            why = f"{ops.EXE_NAME} not found in {text}"
+        else:                    # found but incomplete, and another install is complete
+            first = typed_st.errors[0] if typed_st.errors else "unknown problem"
+            why = f"{typed} is not ready ({first})"
+        lines.append((f"{why}; using {root} instead ({_origin_note(origin)})", WARN))
+    st = typed_st if typed == root and typed_st is not None else ops.check_install(root)
     found = install_lines(st)
     if not text:
         summary, colour = found[0]
@@ -154,7 +180,8 @@ def openpose_report(setting: str) -> OpenPoseReport:
         hint = fix_hint(st)
         found[1:1] = [(hint, WARN)] if hint else []
         found.append((ENTER_FOLDER, WARN))
-    return OpenPoseReport(st.ok, root, lines + found)
+    return OpenPoseReport(st.ok, root, lines + found, setting=text, status=st,
+                          typed_root=typed, typed_status=typed_st)
 
 
 def default_download_parent() -> Path:
@@ -163,12 +190,64 @@ def default_download_parent() -> Path:
     return Path("C:\\") if os.name == "nt" else Path.home()
 
 
-def stop_jobs(timeout_ms: int = 10000) -> None:
-    """Cancel downloads left running by closed dialogs and wait for them (app shutdown)."""
+def _prune_orphans() -> None:
+    keep = []
+    for thread, job in _ORPHANS:
+        if thread.isRunning():
+            keep.append((thread, job))
+        else:
+            thread.wait()   # ended: let its OS thread exit before the QThread is deleted
+    _ORPHANS[:] = keep
+
+
+def jobs_running() -> bool:
+    """True while a download cancelled by closing its dialog is still stopping."""
+    _prune_orphans()
+    return bool(_ORPHANS)
+
+
+def stop_jobs(timeout_ms: int = 0) -> None:
+    """App shutdown: cancel the downloads left running by closed dialogs and wait for them up
+    to `timeout_ms` (default: not at all, the window would freeze). The rest are waited for
+    when Python exits (`_wait_at_exit`), after the window has gone."""
     for thread, job in list(_ORPHANS):
         job.cancel()
         thread.quit()
-        thread.wait(timeout_ms)
+    deadline = time.monotonic() + timeout_ms / 1000
+    for thread, _job in list(_ORPHANS):
+        thread.wait(max(0, int((deadline - time.monotonic()) * 1000)))
+    _prune_orphans()
+
+
+def _wait_at_exit(timeout_s: float | None = None) -> None:
+    """atexit: let cancelled downloads finish (they remove their partial files, e.g. a half
+    unpacked C:\\openpose) before Python deletes their QThreads: deleting a running QThread
+    aborts the process. Runs before PySide's own exit cleanup (registered later)."""
+    running = [(t, j) for t, j in _ORPHANS if t.isRunning()]
+    if not running:
+        return
+    for thread, job in running:
+        job.cancel()
+        thread.quit()
+    if sys.stderr is not None:
+        print("Stopping the cancelled OpenPose download (removing its partial files)…",
+              file=sys.stderr, flush=True)
+    deadline = time.monotonic() + (EXIT_WAIT_S if timeout_s is None else timeout_s)
+    for thread, _job in running:
+        thread.wait(max(0, int((deadline - time.monotonic()) * 1000)))
+    if any(t.isRunning() for t, _ in running):
+        log.warning("the cancelled OpenPose download did not stop; its partial files may be "
+                    "left behind")
+        logging.shutdown()
+        os._exit(0)   # never delete a running QThread (Qt would abort with an error)
+    _prune_orphans()
+
+
+def _register_exit_wait() -> None:
+    global _exit_wait_registered
+    if not _exit_wait_registered:   # after QApplication exists: runs before PySide's cleanup
+        atexit.register(_wait_at_exit)
+        _exit_wait_registered = True
 
 
 # --------------------------------------------------------------------------- #
@@ -212,16 +291,23 @@ class _Job(QObject):
 class OpenPoseDialog(QDialog):
     """Find, download or complete a local OpenPose BODY_25B install.
 
-    `root`: the install known so far (e.g. the auto-detected one), or None.
+    `root`: the install known so far (e.g. the auto-detected one), or None. `status`: its
+    `check_install` result when already known (the project page checks in the background),
+    so that opening the dialog never touches a possibly slow drive on the GUI thread.
     After the dialog closed, `result_root` is the install the user chose, downloaded
     or imported weights into (None when they did none of that).
     """
 
-    def __init__(self, parent=None, root: str | Path | None = None):
+    def __init__(self, parent=None, root: str | Path | None = None, *,
+                 status: ops.InstallStatus | None = None):
         super().__init__(parent)
         self.setWindowTitle("Get OpenPose (BODY_25B)")
         self.setMinimumWidth(520)
-        self._root: Path | None = ops.find_root(root) if root else None
+        if status is not None and status.root is not None:
+            self._root: Path | None = status.root
+        else:
+            status = None
+            self._root = ops.find_root(root) if root else None
         self._picked = False
         self._thread: QThread | None = None
         self._job: _Job | None = None
@@ -309,11 +395,19 @@ class OpenPoseDialog(QDialog):
         lay.addWidget(buttons)
 
         if self._root is not None:
-            self._set_root(self._root, picked=False)
+            self._set_root(self._root, picked=False, status=status)
         else:
             self._show_lines([("No OpenPose folder chosen yet: use an existing one or download "
                                "OpenPose, then import the BODY_25B model file.", MUTED)])
         self._update_buttons()
+
+    def offer_status(self, status: ops.InstallStatus | None) -> None:
+        """An install found meanwhile (the page's background check ended after the dialog
+        opened): shown when nothing is known or chosen yet and no job runs."""
+        if (status is None or status.root is None or self._root is not None
+                or self._picked or self.busy()):
+            return
+        self._set_root(status.root, picked=False, status=status)
 
     # ---- public ----
     def result_root(self) -> Path | None:
@@ -335,10 +429,11 @@ class OpenPoseDialog(QDialog):
     def _show_lines(self, lines: list[tuple[str, str]]) -> None:
         self.status.setText(status_html(lines))
 
-    def _set_root(self, root: Path, *, picked: bool, note: str = "") -> None:
+    def _set_root(self, root: Path, *, picked: bool, note: str = "",
+                  status: ops.InstallStatus | None = None) -> None:
         self._root = Path(root)
         self._picked = self._picked or picked
-        st = ops.check_install(self._root)
+        st = status if status is not None else ops.check_install(self._root)
         if st.variant:
             self.variant_combo.setCurrentIndex(self.variant_combo.findData(st.variant))
         lines = [(note, MUTED)] if note else []
@@ -400,8 +495,9 @@ class OpenPoseDialog(QDialog):
             self.progress.setRange(0, 0)
             return
         if done >= total:
-            self.progress.setRange(0, 0)  # unpacking: no progress information
-            self.progress.setFormat("Unpacking…")
+            # unpacking: no progress information, a busy bar (which draws no text) and
+            # "Unpacking…" in the status line under it
+            self.progress.setRange(0, 0)
             self._show_lines([(f"Unpacking… (download complete; about "
                                f"{ops.OFFICIAL_UNPACKED_SIZE / 1e9:.0f} GB to unpack)", MUTED)])
             return
@@ -488,7 +584,9 @@ class OpenPoseDialog(QDialog):
                     self, "Get OpenPose", "Stop the OpenPose download?",
                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
                 return
-            self._orphan_job()
+            # the question ran an event loop: the download may have ended meanwhile
+            if self.busy():
+                self._orphan_job()
         super().done(r)
 
     def _orphan_job(self) -> None:
@@ -496,6 +594,8 @@ class OpenPoseDialog(QDialog):
         its thread is kept alive in `_ORPHANS` until then, its signals no longer reach
         this dialog."""
         thread, job = self._thread, self._job
+        if thread is None or job is None:
+            return
         job.cancel()
         for signal, slot in ((job.done, self._on_job_done), (job.progress, self._on_progress),
                              (thread.finished, self._on_thread_finished)):
@@ -503,8 +603,9 @@ class OpenPoseDialog(QDialog):
                 signal.disconnect(slot)
             except (RuntimeError, TypeError):
                 pass
-        _ORPHANS[:] = [(t, j) for t, j in _ORPHANS if t.isRunning()]
+        _prune_orphans()
         _ORPHANS.append((thread, job))
+        _register_exit_wait()
         self._thread = None
         self._job = None
         self._kind = ""
