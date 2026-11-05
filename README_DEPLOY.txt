@@ -212,3 +212,73 @@ WII DATA IN THE 3D VIEW (5. 3D View)
   * If the board is not under the subject's feet, the board position is
     wrong (redo the clicks on 2b. Wii Board with the calibration used for
     the .trc).
+
+OPENPOSE BODY_25B (OPTIONAL, NVIDIA GPU)
+----------------------------------------
+The 2D backend "OpenPose · BODY_25B (GPU)" (1. Project) runs CMU's OpenPose
+with its BODY_25B model (25 body keypoints incl. the feet) instead of the
+built-in RTMPose / MediaPipe models. It uses YOUR OWN OpenPose install.
+
+License: OpenPose (Carnegie Mellon University) may be used for academic or
+non-profit NONCOMMERCIAL RESEARCH only and must not be redistributed, so it
+is NOT included in this package. Never add it to a copy of PoseAssess that
+leaves your organization, and never upload it (lab PCs: see below).
+License text:
+https://github.com/CMU-Perceptual-Computing-Lab/openpose/blob/master/LICENSE
+
+Requirements:
+  * an NVIDIA graphics card with driver 456.38 or newer. RTX 50 series
+    (Blackwell) cards do NOT work with OpenPose 1.7.0, nor do very old cards
+    (compute capability below 5.2);
+  * OpenPose 1.7.0, GPU build for Windows:
+    openpose-1.7.0-binaries-win64-gpu-python3.7-flir-3d_recommended.zip
+    (https://github.com/CMU-Perceptual-Computing-Lab/openpose/releases/tag/v1.7.0).
+    The CPU build cannot run BODY_25B (the GPU build has
+    bin\cudart64_110.dll next to bin\OpenPoseDemo.exe);
+  * the BODY_25B files (step 2). CMU no longer offers the weights
+    (.caffemodel) for download: you supply them (e.g. from your lab).
+
+Setup:
+1. Put OpenPose in C:\openpose (the folder with bin\OpenPoseDemo.exe and
+   models\): PoseAssess finds it there by itself (also D:\openpose,
+   %USERPROFILE%\openpose and the last folder used on this PC). Anywhere
+   else: enter the folder under "OpenPose folder" on 1. Project, or use
+   Browse... next to it. Avoid non-ASCII characters in the path.
+   Or: 1. Project > "Get OpenPose..." > tick the license box > "Download
+   official OpenPose 1.7.0 (418 MB)...": it downloads CMU's official release
+   from GitHub onto this PC and unpacks it into <chosen folder>\openpose
+   (choose C:\ to get C:\openpose; about 1.5 GB of free disk space needed).
+   The bar shows the download, then "Unpacking..."; Cancel (or closing the
+   window) stops it and removes the partial files.
+2. The BODY_25B files must have EXACTLY these names:
+       models\pose\body_25b\pose_deploy.prototxt
+       models\pose\body_25b\pose_iter_XXXXXX.caffemodel
+   ("XXXXXX" literally: rename e.g. pose_iter_464000.caffemodel to
+   pose_iter_XXXXXX.caffemodel). Other pose_iter_*.caffemodel files in that
+   folder (e.g. copies of the COCO or BODY_25 weights) are ignored.
+   The prototxt must belong to the same network as the weights:
+   "1_25BBkg" (Option 2, recommended by CMU) or "1_25BSuperModel11FullVGG"
+   (Option 1, maximum accuracy, slower), see
+   https://github.com/CMU-Perceptual-Computing-Lab/openpose_train/tree/master/experimental_models
+   Easier: "Get OpenPose..." > choose the variant (that of an installed
+   official prototxt is preselected) > "Import BODY_25B model file
+   (.caffemodel)...": the file is copied under the right name and the
+   matching official prototxt is downloaded.
+3. Choose "OpenPose · BODY_25B (GPU)" as 2D backend and press Save settings.
+   The line under "OpenPose folder" should say "OpenPose ready: ..." in
+   green. If no usable OpenPose is found, the field is framed in amber and
+   the line says "Enter the OpenPose folder (e.g. C:\openpose) or use Get
+   OpenPose...", with what is missing and how to fix it. The line also
+   warns about an unsupported GPU / driver.
+   A folder that checks OK is remembered on this PC for every project.
+
+Lab PCs: use the INTERNAL package made with pack_with_openpose.bat (see the
+pack_with_openpose.bat section): PoseAssess together with the lab's own
+OpenPose, kept on the lab's shared drive. Never upload that package or pass
+it on outside the lab. The license allows such copies only inside your
+organization: "If Licensee is an organization, it may make that number of
+copies of the Software necessary for internal noncommercial use at a single
+site within its organization provided that all information appearing in or
+on the original labels, including the copyright and trademark notices are
+copied onto the labels of the copies." Never pass OpenPose (or its model
+files) on to anyone outside your organization / site.
