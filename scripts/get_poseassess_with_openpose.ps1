@@ -163,10 +163,19 @@ function Get-ZipState([string]$Path) {
         $z.Dispose()
         return 'ok'
     } catch {
+        # .NET wraps the cause: InvalidDataException(inner: IOException ...) for a cut-off
+        # zip, so look at the whole chain. Busy = sharing / lock violation or access denied.
+        $busy = $false
         $ex = $_.Exception
-        while ($null -ne $ex.InnerException) { $ex = $ex.InnerException }
-        if ($ex -is [System.IO.InvalidDataException]) { return 'broken' }
-        return 'busy'
+        while ($null -ne $ex) {
+            if ($ex -is [System.IO.InvalidDataException]) { return 'broken' }
+            if ($ex -is [System.UnauthorizedAccessException]) { $busy = $true }
+            if ($ex -is [System.IO.IOException] -and
+                ($ex.HResult -eq -2147024864 -or $ex.HResult -eq -2147024863)) { $busy = $true }
+            $ex = $ex.InnerException
+        }
+        if ($busy) { return 'busy' }
+        return 'broken'
     }
 }
 
