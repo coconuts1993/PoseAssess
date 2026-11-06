@@ -296,6 +296,13 @@ the lab's other PCs. It is for internal noncommercial use at your site only
 (OpenPose license, see above): keep it on the lab's shared drive, NEVER
 upload or publish it.
 
+Starting from nothing (PoseAssess not downloaded yet): on the PC with
+OpenPose, double-click scripts\get_poseassess_with_openpose.bat from the
+PoseAssess repository (keep the .ps1 next to it). It opens the download
+page (GitHub login), waits for PoseAssess_Portable_win64.zip, unzips both
+zip levels to D:\PoseAssess_Portable (or C:\PoseAssess\...) and runs the
+steps below for you.
+
 1. On a PC where OpenPose works (1. Project says "OpenPose ready"),
    double-click  pack_with_openpose.bat  in the PoseAssess folder. It finds
    that OpenPose like PoseAssess does (e.g. C:\openpose), checks it, shows

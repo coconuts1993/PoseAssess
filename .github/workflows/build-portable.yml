@@ -124,6 +124,83 @@ jobs:
           Pop-Location
           "{0:N0} MB" -f ((Get-Item PoseAssess_Portable_win64.zip).Length / 1MB)
 
+      - name: get_poseassess_with_openpose.bat unzips the artifact and packs (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bat = 'scripts\get_poseassess_with_openpose.bat'
+          $inner = "$env:GITHUB_WORKSPACE\PoseAssess_Portable_win64.zip"
+          $t = Join-Path $env:RUNNER_TEMP 'getpa'
+          New-Item -ItemType Directory -Force "$t\dl", "$t\neg" | Out-Null
+          "free on the temp drive: {0:N1} GB" -f ((Get-PSDrive ($env:RUNNER_TEMP.Substring(0, 1))).Free / 1GB)
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $z = [System.IO.Compression.ZipFile]::OpenRead($inner)
+          $files = @($z.Entries | Where-Object { -not $_.FullName.EndsWith('/') })
+          $longest = [int]($z.Entries | ForEach-Object { $_.FullName.Length - 'PoseAssess_Portable/'.Length } | Measure-Object -Maximum).Maximum
+          $z.Dispose()
+          "package zip: $($files.Count) files, longest name in PoseAssess_Portable: $longest characters"
+
+          # 1. Refusals change nothing: not a PoseAssess zip, a broken zip, a too deep folder
+          Set-Content -Encoding ascii "$t\neg\hello.txt" 'hello'
+          Compress-Archive -Path "$t\neg\hello.txt" -DestinationPath "$t\neg\other.zip"
+          [System.IO.File]::WriteAllBytes("$t\neg\broken.zip", [byte[]](80, 75, 3, 4, 20, 0, 0, 0, 1, 2, 3))
+          $cases = @(@("$t\neg\other.zip", 'not a PoseAssess package', "$t\neg\o1"),
+                     @("$t\neg\broken.zip", 'not a readable zip', "$t\neg\o2"))
+          $deepLen = 245 - $longest   # dest + \PoseAssess_Portable\ + longest > 259
+          if ($deepLen -gt "$t\neg".Length + 2 -and $deepLen -lt 190) {
+            $cases += , @($inner, 'too deep for Windows path length limits', "$t\neg\" + ('d' * ($deepLen - "$t\neg".Length - 1)))
+          } else { "(too-deep case skipped: longest name $longest)" }
+          foreach ($c in $cases) {
+            $ErrorActionPreference = 'Continue'
+            $out = cmd.exe /d /c "$bat -Zip $($c[0]) -Dest $($c[2]) -NoPack -Yes <NUL" | Out-String
+            $code = $LASTEXITCODE
+            $ErrorActionPreference = 'Stop'
+            Write-Host $out
+            if ($code -eq 0) { throw "expected a refusal for $($c[0])" }
+            if ($out -notmatch [regex]::Escape($c[1])) { throw "expected '$($c[1])' for $($c[0])" }
+            if (Test-Path -LiteralPath "$($c[2])\PoseAssess_Portable") { throw "PoseAssess_Portable left behind for $($c[0])" }
+            if (Get-ChildItem -LiteralPath $c[2] -Filter '_poseassess_*' -ErrorAction SilentlyContinue) { throw "temporary file left behind for $($c[0])" }
+          }
+
+          # 2. Unzip a browser download (a zip around PoseAssess_Portable_win64.zip), as a user
+          #    starts it (stdin from NUL: the final pause returns at once)
+          7z a -tzip -mx=0 "$t\dl\PoseAssess_Portable_win64.zip" $inner | Select-Object -Last 2
+          cmd.exe /d /c "$bat -Zip $t\dl\PoseAssess_Portable_win64.zip -Dest $t\out -NoPack -Yes <NUL"
+          if ($LASTEXITCODE -ne 0) { throw "get_poseassess_with_openpose.bat failed: exit $LASTEXITCODE" }
+          $pa = "$t\out\PoseAssess_Portable"
+          foreach ($f in 'run.bat', 'pack_with_openpose.bat', 'python311\python.exe', 'venv\Scripts\python.exe') {
+            if (-not (Test-Path -LiteralPath "$pa\$f")) { throw "missing after unzip: $f" }
+          }
+          if (Test-Path -LiteralPath "$pa\.poseassess_unzip_incomplete") { throw "unzip marker left behind" }
+          $got = @(Get-ChildItem -LiteralPath $pa -Recurse -Force | Where-Object { -not $_.PSIsContainer }).Count
+          "files in the zip: $($files.Count), unzipped: $got"
+          if ($got -ne $files.Count) { throw "unzipped file count differs" }
+          if (Get-ChildItem -LiteralPath "$t\out" -Filter '_poseassess_*') { throw "temporary file left behind" }
+          Remove-Item -LiteralPath "$t\dl" -Recurse -Force
+
+          # 3. Second run: the folder is there (-Yes uses it) and a stand-in OpenPose BODY_25B
+          #    folder (dummy files; nothing is run) is packed by pack_with_openpose.bat
+          $op = "$t\fake_openpose"
+          New-Item -ItemType Directory -Force "$op\bin", "$op\models\pose\body_25b" | Out-Null
+          Set-Content -Encoding ascii "$op\bin\OpenPoseDemo.exe" 'stand-in'
+          Set-Content -Encoding ascii "$op\bin\cudart64_110.dll" 'stand-in'
+          Set-Content -Encoding ascii "$op\models\pose\body_25b\pose_deploy.prototxt" 'name: "stand-in"'
+          Set-Content -Encoding ascii "$op\models\pose\body_25b\pose_iter_XXXXXX.caffemodel" 'stand-in'
+          Set-Content -Encoding ascii "$op\LICENSE" 'stand-in license'
+          cmd.exe /d /c "$bat -Dest $t\out -OpenPose $op -Yes <NUL"
+          if ($LASTEXITCODE -ne 0) { throw "get_poseassess_with_openpose.bat (pack) failed: exit $LASTEXITCODE" }
+          $packed = "$t\out\PoseAssess_Portable_with_OpenPose.zip"
+          if (-not (Test-Path -LiteralPath $packed)) { throw "no $packed" }
+          $z = [System.IO.Compression.ZipFile]::OpenRead($packed)
+          $names = @($z.Entries | ForEach-Object { $_.FullName })
+          $z.Dispose()
+          foreach ($n in 'PoseAssess_Portable/run.bat', 'PoseAssess_Portable/openpose/bin/OpenPoseDemo.exe',
+                         'PoseAssess_Portable/openpose/models/pose/body_25b/pose_iter_XXXXXX.caffemodel') {
+            if ($names -notcontains $n) { throw "$n is not in the packed zip" }
+          }
+          "packed zip: $($names.Count) entries, {0:N0} MB" -f ((Get-Item -LiteralPath $packed).Length / 1MB)
+          Remove-Item -LiteralPath $t -Recurse -Force
+
       - uses: actions/upload-artifact@v4
         with:
           name: PoseAssess_Portable_win64
