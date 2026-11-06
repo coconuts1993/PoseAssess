@@ -148,9 +148,11 @@ jobs:
                      @("$t\neg\broken.zip", 'not a readable zip', "$t\neg\o2"))
           $deepLen = 245 - $longest   # dest + \PoseAssess_Portable\ + longest > 259
           if ($deepLen -gt "$t\neg".Length + 2 -and $deepLen -lt 190) {
-            $cases += , @($inner, 'too deep for Windows path length limits', "$t\neg\" + ('d' * ($deepLen - "$t\neg".Length - 1)))
+            $deep = "$t\neg\" + ('d' * ($deepLen - "$t\neg".Length - 1))
+            $cases += , @($inner, 'too deep for Windows path length limits', $deep)
           } else { "(too-deep case skipped: longest name $longest)" }
           foreach ($c in $cases) {
+            if ($c.Count -ne 3) { throw "test case is not (zip, message, dest): $($c -join ' | ')" }
             $ErrorActionPreference = 'Continue'
             $out = cmd.exe /d /c "$bat -Zip $($c[0]) -Dest $($c[2]) -NoPack -Yes <NUL" | Out-String
             $code = $LASTEXITCODE
