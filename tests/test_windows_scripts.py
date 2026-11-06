@@ -85,3 +85,15 @@ def test_launcher_has_no_block_around_the_folder_echo():
     text = BAT.read_bytes().decode("ascii")
     assert 'if exist "%PS1%" goto run' in text and ":run" in text
     assert "(" not in text.split(":run")[0].split("setlocal", 1)[1]
+
+
+def test_only_its_own_temporary_names_are_removed():
+    """Remove-Item only on the script's own temporary paths (unzip folder, inner zip, probe,
+    leftovers of those names); the user's PoseAssess_Portable is only ever renamed."""
+    text = PS1.read_text(encoding="ascii")
+    assert _ps_string(text, "StagePrefix") == "_pa_unzip_"
+    assert _ps_string(text, "TempZipPrefix") == "_poseassess_download_"
+    targets = re.findall(r"Remove-Item -LiteralPath (\S+)", text)
+    assert sorted(set(targets)) == ["$l.FullName", "$probe", "$stage", "$tempInner"], targets
+    assert "Remove-Item -LiteralPath $Final" not in text
+    assert "Rename-WithRetry $stage $DefaultName" in text

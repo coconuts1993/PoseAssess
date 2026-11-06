@@ -139,29 +139,46 @@ jobs:
           $longest = [int]($z.Entries | ForEach-Object { $_.FullName.Length - 'PoseAssess_Portable/'.Length } | Measure-Object -Maximum).Maximum
           $z.Dispose()
           "package zip: $($files.Count) files, longest name in PoseAssess_Portable: $longest characters"
+          function Get-Leftovers($dir) {
+            @(Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -like '_pa_unzip_*' -or $_.Name -like '_poseassess_*' })
+          }
+          # A stand-in OpenPose BODY_25B folder (dummy files; nothing is run)
+          $op = "$t\fake_openpose"
+          New-Item -ItemType Directory -Force "$op\bin", "$op\models\pose\body_25b" | Out-Null
+          Set-Content -Encoding ascii "$op\bin\OpenPoseDemo.exe" 'stand-in'
+          Set-Content -Encoding ascii "$op\bin\cudart64_110.dll" 'stand-in'
+          Set-Content -Encoding ascii "$op\models\pose\body_25b\pose_deploy.prototxt" 'name: "stand-in"'
+          Set-Content -Encoding ascii "$op\models\pose\body_25b\pose_iter_XXXXXX.caffemodel" 'stand-in'
+          Set-Content -Encoding ascii "$op\LICENSE" 'stand-in license'
 
-          # 1. Refusals change nothing: not a PoseAssess zip, a broken zip, a too deep folder
+          # 1. Refusals change nothing: not a PoseAssess zip, a broken zip, an older build
+          #    (no pack_with_openpose.bat), a too deep folder
           Set-Content -Encoding ascii "$t\neg\hello.txt" 'hello'
           Compress-Archive -Path "$t\neg\hello.txt" -DestinationPath "$t\neg\other.zip"
           [System.IO.File]::WriteAllBytes("$t\neg\broken.zip", [byte[]](80, 75, 3, 4, 20, 0, 0, 0, 1, 2, 3))
-          $cases = @(@("$t\neg\other.zip", 'not a PoseAssess package', "$t\neg\o1"),
-                     @("$t\neg\broken.zip", 'not a readable zip', "$t\neg\o2"))
-          $deepLen = 245 - $longest   # dest + \PoseAssess_Portable\ + longest > 259
+          New-Item -ItemType Directory -Force "$t\neg\oldbuild\PoseAssess_Portable" | Out-Null
+          Set-Content -Encoding ascii "$t\neg\oldbuild\PoseAssess_Portable\run.bat" '@echo off'
+          Compress-Archive -Path "$t\neg\oldbuild\PoseAssess_Portable" -DestinationPath "$t\neg\oldbuild.zip"
+          $cases = @(@("$t\neg\other.zip", 'not a PoseAssess package', "$t\neg\o1", '-NoPack'),
+                     @("$t\neg\broken.zip", 'not a readable zip', "$t\neg\o2", '-NoPack'),
+                     @("$t\neg\oldbuild.zip", 'older PoseAssess build', "$t\neg\o3", "-OpenPose $op"))
+          $deepLen = 240 - $longest   # dest + \_pa_unzip_<time>\ + longest > 259
           if ($deepLen -gt "$t\neg".Length + 2 -and $deepLen -lt 190) {
             $deep = "$t\neg\" + ('d' * ($deepLen - "$t\neg".Length - 1))
-            $cases += , @($inner, 'too deep for Windows path length limits', $deep)
+            $cases += , @($inner, 'too deep for Windows path length limits', $deep, '-NoPack')
           } else { "(too-deep case skipped: longest name $longest)" }
           foreach ($c in $cases) {
-            if ($c.Count -ne 3) { throw "test case is not (zip, message, dest): $($c -join ' | ')" }
+            if ($c.Count -ne 4) { throw "test case is not (zip, message, dest, args): $($c -join ' | ')" }
             $ErrorActionPreference = 'Continue'
-            $out = cmd.exe /d /c "$bat -Zip $($c[0]) -Dest $($c[2]) -NoPack -Yes <NUL" | Out-String
+            $out = cmd.exe /d /c "$bat -Zip $($c[0]) -Dest $($c[2]) $($c[3]) -Yes <NUL" | Out-String
             $code = $LASTEXITCODE
             $ErrorActionPreference = 'Stop'
             Write-Host $out
             if ($code -eq 0) { throw "expected a refusal for $($c[0])" }
             if ($out -notmatch [regex]::Escape($c[1])) { throw "expected '$($c[1])' for $($c[0])" }
             if (Test-Path -LiteralPath "$($c[2])\PoseAssess_Portable") { throw "PoseAssess_Portable left behind for $($c[0])" }
-            if (Get-ChildItem -LiteralPath $c[2] -Filter '_poseassess_*' -ErrorAction SilentlyContinue) { throw "temporary file left behind for $($c[0])" }
+            if ((Get-Leftovers $c[2]).Count) { throw "temporary files left behind for $($c[0]): $((Get-Leftovers $c[2]).Name -join ', ')" }
           }
 
           # 2. Unzip a browser download (a zip around PoseAssess_Portable_win64.zip), as a user
@@ -173,34 +190,43 @@ jobs:
           foreach ($f in 'run.bat', 'pack_with_openpose.bat', 'python311\python.exe', 'venv\Scripts\python.exe') {
             if (-not (Test-Path -LiteralPath "$pa\$f")) { throw "missing after unzip: $f" }
           }
-          if (Test-Path -LiteralPath "$pa\.poseassess_unzip_incomplete") { throw "unzip marker left behind" }
           $got = @(Get-ChildItem -LiteralPath $pa -Recurse -Force | Where-Object { -not $_.PSIsContainer }).Count
           "files in the zip: $($files.Count), unzipped: $got"
           if ($got -ne $files.Count) { throw "unzipped file count differs" }
-          if (Get-ChildItem -LiteralPath "$t\out" -Filter '_poseassess_*') { throw "temporary file left behind" }
+          if ((Get-Leftovers "$t\out").Count) { throw "temporary files left behind: $((Get-Leftovers "$t\out").Name -join ', ')" }
           Remove-Item -LiteralPath "$t\dl" -Recurse -Force
 
-          # 3. Second run: the folder is there (-Yes uses it) and a stand-in OpenPose BODY_25B
-          #    folder (dummy files; nothing is run) is packed by pack_with_openpose.bat
-          $op = "$t\fake_openpose"
-          New-Item -ItemType Directory -Force "$op\bin", "$op\models\pose\body_25b" | Out-Null
-          Set-Content -Encoding ascii "$op\bin\OpenPoseDemo.exe" 'stand-in'
-          Set-Content -Encoding ascii "$op\bin\cudart64_110.dll" 'stand-in'
-          Set-Content -Encoding ascii "$op\models\pose\body_25b\pose_deploy.prototxt" 'name: "stand-in"'
-          Set-Content -Encoding ascii "$op\models\pose\body_25b\pose_iter_XXXXXX.caffemodel" 'stand-in'
-          Set-Content -Encoding ascii "$op\LICENSE" 'stand-in license'
+          # 3. The folder is there ([U] with -Yes): pack the stand-in OpenPose
+          function Test-Packed($zipPath) {
+            if (-not (Test-Path -LiteralPath $zipPath)) { throw "no $zipPath" }
+            $z = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+            $names = @($z.Entries | ForEach-Object { $_.FullName })
+            $z.Dispose()
+            foreach ($n in 'PoseAssess_Portable/run.bat', 'PoseAssess_Portable/openpose/bin/OpenPoseDemo.exe',
+                           'PoseAssess_Portable/openpose/models/pose/body_25b/pose_iter_XXXXXX.caffemodel') {
+              if ($names -notcontains $n) { throw "$n is not in $zipPath" }
+            }
+            "packed zip: $($names.Count) entries, {0:N0} MB" -f ((Get-Item -LiteralPath $zipPath).Length / 1MB)
+          }
           cmd.exe /d /c "$bat -Dest $t\out -OpenPose $op -Yes <NUL"
           if ($LASTEXITCODE -ne 0) { throw "get_poseassess_with_openpose.bat (pack) failed: exit $LASTEXITCODE" }
-          $packed = "$t\out\PoseAssess_Portable_with_OpenPose.zip"
-          if (-not (Test-Path -LiteralPath $packed)) { throw "no $packed" }
-          $z = [System.IO.Compression.ZipFile]::OpenRead($packed)
-          $names = @($z.Entries | ForEach-Object { $_.FullName })
-          $z.Dispose()
-          foreach ($n in 'PoseAssess_Portable/run.bat', 'PoseAssess_Portable/openpose/bin/OpenPoseDemo.exe',
-                         'PoseAssess_Portable/openpose/models/pose/body_25b/pose_iter_XXXXXX.caffemodel') {
-            if ($names -notcontains $n) { throw "$n is not in the packed zip" }
-          }
-          "packed zip: $($names.Count) entries, {0:N0} MB" -f ((Get-Item -LiteralPath $packed).Length / 1MB)
+          Test-Packed "$t\out\PoseAssess_Portable_with_OpenPose.zip"
+          Remove-Item -LiteralPath "$t\out" -Recurse -Force
+
+          # 4. An older build is there ([R] with -Yes): the new copy is unzipped next to it,
+          #    the old folder is renamed (its data kept), then the new one is packed
+          $r = "$t\r"
+          New-Item -ItemType Directory -Force "$r\PoseAssess_Portable\recordings" | Out-Null
+          Set-Content -Encoding ascii "$r\PoseAssess_Portable\run.bat" '@echo off'
+          Set-Content -Encoding ascii "$r\PoseAssess_Portable\recordings\keep.txt" 'participant data'
+          cmd.exe /d /c "$bat -Zip $inner -Dest $r -OpenPose $op -Yes <NUL"
+          if ($LASTEXITCODE -ne 0) { throw "get_poseassess_with_openpose.bat ([R]) failed: exit $LASTEXITCODE" }
+          $old = @(Get-ChildItem -LiteralPath $r -Directory -Filter 'PoseAssess_Portable_old_*')
+          if ($old.Count -ne 1) { throw "expected one PoseAssess_Portable_old_* folder, found $($old.Count)" }
+          if ((Get-Content -LiteralPath "$($old[0].FullName)\recordings\keep.txt") -ne 'participant data') { throw "old data changed" }
+          if (-not (Test-Path -LiteralPath "$r\PoseAssess_Portable\pack_with_openpose.bat")) { throw "new copy not in place" }
+          if ((Get-Leftovers $r).Count) { throw "temporary files left behind: $((Get-Leftovers $r).Name -join ', ')" }
+          Test-Packed "$r\PoseAssess_Portable_with_OpenPose.zip"
           Remove-Item -LiteralPath $t -Recurse -Force
 
       - uses: actions/upload-artifact@v4

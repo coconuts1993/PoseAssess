@@ -5,18 +5,22 @@
 .DESCRIPTION
   Start it with get_poseassess_with_openpose.bat (double-click; keep the .bat and this
   .ps1 in the same folder). It
-    1. finds the downloaded PoseAssess_Portable_win64*.zip in your Downloads folder, or
+    1. checks the OpenPose BODY_25B folder on this PC (e.g. C:\openpose);
+    2. finds the downloaded PoseAssess_Portable_win64*.zip in your Downloads folder, or
        opens the GitHub download page (log in to GitHub) and waits for the download;
-    2. unzips it (both zip levels) to <Dest>\PoseAssess_Portable
+    3. unzips it (both zip levels) to <Dest>\PoseAssess_Portable
        (default D:\ when there is a local D: drive, else C:\PoseAssess);
-    3. runs PoseAssess_Portable\pack_with_openpose.bat --src <OpenPose folder>: it copies
-       the BODY_25B parts of OpenPose (e.g. C:\openpose) into PoseAssess_Portable\openpose
-       and writes <Dest>\PoseAssess_Portable_with_OpenPose.zip for the lab's shared drive.
+    4. runs PoseAssess_Portable\pack_with_openpose.bat --src <OpenPose folder>: it copies
+       the BODY_25B parts of OpenPose into PoseAssess_Portable\openpose and writes
+       <Dest>\PoseAssess_Portable_with_OpenPose.zip for the lab's shared drive.
   OpenPose license (CMU): internal non-commercial use at your site only.
   NEVER upload or publish the _with_OpenPose zip.
-  Nothing is ever deleted except what this script itself made (its temporary zip, or an
-  unzip of its own that failed). An existing PoseAssess_Portable is only renamed, and only
-  after a new download has been checked.
+  Nothing is deleted except what this script itself made: its temporary zip and unzip
+  folder (_poseassess_download_*.zip, _pa_unzip_*; also leftovers of an interrupted
+  earlier run) and empty folders it made for a place you then declined. The new copy is
+  unzipped next to PoseAssess_Portable and renamed only when complete; an existing
+  PoseAssess_Portable is never written into, only renamed (to PoseAssess_Portable_old_<date>,
+  after you chose [R] and the new copy is complete).
 
 .EXAMPLE
   get_poseassess_with_openpose.bat
@@ -26,10 +30,10 @@
   get_poseassess_with_openpose.bat -NoPack        (only download + unzip)
   get_poseassess_with_openpose.bat -Yes           (unattended, see below)
   -Yes: no questions. Takes the default answers, uses an existing PoseAssess_Portable folder
-  as it is (renames it if an earlier unzip into it did not finish), stops where a typed
-  answer is needed, and passes --yes to pack_with_openpose.bat: with -Yes YOU accept the
-  OpenPose license note it shows, and an existing openpose folder in PoseAssess_Portable and
-  an existing zip of the same name are replaced.
+  as it is ([R] if it is an older build without pack_with_openpose.bat), stops where a
+  typed answer is needed, and passes --yes to pack_with_openpose.bat: with -Yes YOU accept
+  the OpenPose license note it shows, and an existing openpose folder in
+  PoseAssess_Portable and an existing zip of the same name are replaced.
 
   This file must stay plain ASCII (Windows PowerShell 5.1 reads it in the ANSI code page).
 #>
@@ -51,7 +55,9 @@ $ErrorActionPreference = 'Stop'
 $ZipPattern = 'PoseAssess_Portable_win64*.zip'
 $DefaultName = 'PoseAssess_Portable'
 $OutSuffix = '_with_OpenPose.zip'
-$Marker = '.poseassess_unzip_incomplete'
+$StagePrefix = '_pa_unzip_'
+$TempZipPrefix = '_poseassess_download_'
+$LockName = '_poseassess_get.lock'
 $NeedFreeGB = 8
 $MaxPath = 259
 
@@ -111,6 +117,10 @@ function Format-Size([long]$Bytes) {
     return ('{0:N0} MB' -f ($Bytes / 1MB))
 }
 
+function Format-Elapsed([TimeSpan]$Span) {
+    return ('{0}:{1:00}' -f [int][Math]::Floor($Span.TotalMinutes), $Span.Seconds)
+}
+
 function Get-FreeBytes([string]$Path) {
     try {
         $root = [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($Path))
@@ -118,6 +128,39 @@ function Get-FreeBytes([string]$Path) {
         if ($drive.IsReady) { return [long]$drive.AvailableFreeSpace }
     } catch { }
     return [long]-1
+}
+
+# The folders of $Dir that do not exist yet (outermost first).
+function Get-MissingDirs([string]$Dir) {
+    $missing = @()
+    $d = $Dir
+    while ($d -and -not (Test-Path -LiteralPath $d)) {
+        $missing = @($d) + $missing
+        $d = [System.IO.Path]::GetDirectoryName($d)
+    }
+    return $missing
+}
+
+# Removes folders this script made, innermost first, only while they are empty.
+function Remove-OwnEmptyDirs($Dirs) {
+    $list = @($Dirs)
+    [array]::Reverse($list)
+    foreach ($d in $list) {
+        try { [System.IO.Directory]::Delete($d, $false) } catch { }
+    }
+}
+
+# Rename with a few retries (a virus scanner may hold a just-written file for a moment).
+function Rename-WithRetry([string]$Path, [string]$NewName) {
+    for ($i = 1; $true; $i++) {
+        try {
+            Rename-Item -LiteralPath $Path -NewName $NewName
+            return
+        } catch {
+            if ($i -ge 10) { throw }
+            Start-Sleep -Seconds 1
+        }
+    }
 }
 
 function Get-DownloadsDir {
@@ -139,20 +182,78 @@ function Find-PackageZips([string]$Dir) {
         Sort-Object LastWriteTime -Descending)
 }
 
-function Test-OpenPoseDir([string]$Dir) {
-    if (-not $Dir) { return $false }
-    if (-not (Test-Path -LiteralPath $Dir -PathType Container)) { return $false }
-    $body25b = PathJoin $Dir 'models\pose\body_25b'
-    return ((Test-Path -LiteralPath (PathJoin $Dir 'bin\OpenPoseDemo.exe')) -and
-            (Test-Path -LiteralPath (PathJoin $body25b 'pose_deploy.prototxt')) -and
-            (Test-Path -LiteralPath (PathJoin $body25b 'pose_iter_XXXXXX.caffemodel')))
+# A typed / dragged / -Zip path: the zip file itself, or a folder holding one ('' = none).
+function Resolve-ZipInput([string]$Path) {
+    $p = $Path.Trim().Trim('"')
+    if (-not $p) { return '' }
+    if (Test-Path -LiteralPath $p -PathType Leaf) { return [System.IO.Path]::GetFullPath($p) }
+    if (Test-Path -LiteralPath $p -PathType Container) {
+        $found = @(Find-PackageZips $p)
+        if ($found.Count -gt 0) { return $found[0].FullName }
+    }
+    return ''
 }
 
-function Show-OpenPoseProblem([string]$Dir) {
-    Say "  Not a usable OpenPose folder: $Dir"
-    Say '  It needs:  bin\OpenPoseDemo.exe'
-    Say '             models\pose\body_25b\pose_deploy.prototxt'
-    Say '             models\pose\body_25b\pose_iter_XXXXXX.caffemodel'
+# The OpenPose install root for a given path, like PoseAssess's find_root: the root, its
+# bin folder, OpenPoseDemo.exe, or a folder holding an "openpose" folder.
+function Resolve-OpenPoseRoot([string]$Path) {
+    $p = $Path.Trim().Trim('"').TrimEnd('\')
+    if (-not $p) { return '' }
+    if ($p -match '^[A-Za-z]:$') { $p += '\' }
+    if ((Test-Path -LiteralPath $p -PathType Leaf) -and ([System.IO.Path]::GetFileName($p) -eq 'OpenPoseDemo.exe')) {
+        $p = [System.IO.Path]::GetDirectoryName($p)
+    }
+    if (-not (Test-Path -LiteralPath $p -PathType Container)) { return $p }
+    if (Test-Path -LiteralPath (PathJoin $p 'bin\OpenPoseDemo.exe')) { return $p }
+    if ((Test-Path -LiteralPath (PathJoin $p 'OpenPoseDemo.exe')) -and ([System.IO.Path]::GetFileName($p) -eq 'bin')) {
+        return [System.IO.Path]::GetDirectoryName($p)
+    }
+    $sub = PathJoin $p 'openpose'
+    if (Test-Path -LiteralPath (PathJoin $sub 'bin\OpenPoseDemo.exe')) { return $sub }
+    return $p
+}
+
+# What is wrong with an OpenPose root for BODY_25B (empty = fine); the same checks as
+# PoseAssess's check_install, which the pack step runs again.
+function Get-OpenPoseProblems([string]$Root) {
+    if (-not $Root -or -not (Test-Path -LiteralPath $Root -PathType Container)) { return @('folder not found') }
+    $problems = @()
+    $bin = PathJoin $Root 'bin'
+    if (-not (Test-Path -LiteralPath (PathJoin $bin 'OpenPoseDemo.exe') -PathType Leaf)) {
+        $problems += 'bin\OpenPoseDemo.exe is missing'
+    } elseif (@(Get-ChildItem -LiteralPath $bin -Filter 'cudart64_*.dll' -ErrorAction SilentlyContinue).Count -eq 0) {
+        $problems += 'CPU-only OpenPose (no bin\cudart64_*.dll): BODY_25B needs the GPU build'
+    }
+    $mdir = PathJoin $Root 'models\pose\body_25b'
+    if (-not (Test-Path -LiteralPath (PathJoin $mdir 'pose_deploy.prototxt') -PathType Leaf)) {
+        $problems += 'models\pose\body_25b\pose_deploy.prototxt is missing'
+    }
+    $weights = PathJoin $mdir 'pose_iter_XXXXXX.caffemodel'
+    if (Test-Path -LiteralPath $weights -PathType Leaf) {
+        if ((Get-Item -LiteralPath $weights).Length -eq 0) {
+            $problems += 'models\pose\body_25b\pose_iter_XXXXXX.caffemodel is empty'
+        }
+    } else {
+        $others = @(Get-ChildItem -LiteralPath $mdir -Filter 'pose_iter_*.caffemodel' -ErrorAction SilentlyContinue)
+        if ($others.Count -gt 0) {
+            $problems += "the BODY_25B weights must be named pose_iter_XXXXXX.caffemodel: rename $($others[0].Name)"
+        } else {
+            $problems += 'models\pose\body_25b\pose_iter_XXXXXX.caffemodel (the BODY_25B weights) is missing'
+        }
+    }
+    return $problems
+}
+
+# The OpenPose folder PoseAssess remembers on this PC (1. Project), or ''.
+function Get-RememberedOpenPose {
+    try {
+        $f = PathJoin (PathJoin $env:APPDATA 'PoseAssess') 'openpose.json'
+        if (Test-Path -LiteralPath $f -PathType Leaf) {
+            $v = (Get-Content -LiteralPath $f -Raw -Encoding UTF8 | ConvertFrom-Json).openpose_dir
+            if ($v) { return [string]$v }
+        }
+    } catch { }
+    return ''
 }
 
 # 'ok', 'broken' (not a zip / cut off) or 'busy' (cannot be opened now, e.g. still being
@@ -179,22 +280,29 @@ function Get-ZipState([string]$Path) {
     }
 }
 
-# What a zip is: the PoseAssess package itself (a top folder with run.bat), the GitHub
-# download around it (one .zip inside), or something else.
+# What a zip is: the PoseAssess package itself (a top folder with run.bat; HasPack: it has
+# pack_with_openpose.bat, i.e. it is not an older build), the GitHub download around it
+# (one .zip inside), or something else.
 function Get-ZipKind([string]$Path) {
     $z = [System.IO.Compression.ZipFile]::OpenRead($Path)
     try {
         $innerZips = @()
+        $runTops = @()
+        $packTops = @()
         $rootRunBat = $false
+        $rootPack = $false
         foreach ($e in $z.Entries) {
             $n = $e.FullName.Replace('\', '/')
-            if ($n -match '^([^/]+)/run\.bat$') {
-                return @{ Kind = 'package'; Top = $Matches[1] }
-            }
-            if ($n -eq 'run.bat') { $rootRunBat = $true }
-            if ($n -notmatch '/' -and $n.ToLower().EndsWith('.zip')) { $innerZips += $n }
+            if ($n -match '^([^/]+)/run\.bat$') { $runTops += $Matches[1] }
+            elseif ($n -match '^([^/]+)/pack_with_openpose\.bat$') { $packTops += $Matches[1] }
+            elseif ($n -eq 'run.bat') { $rootRunBat = $true }
+            elseif ($n -eq 'pack_with_openpose.bat') { $rootPack = $true }
+            elseif ($n -notmatch '/' -and $n.ToLower().EndsWith('.zip')) { $innerZips += $n }
         }
-        if ($rootRunBat) { return @{ Kind = 'package'; Top = '' } }
+        if ($runTops.Count -gt 0) {
+            return @{ Kind = 'package'; Top = $runTops[0]; HasPack = ($packTops -contains $runTops[0]) }
+        }
+        if ($rootRunBat) { return @{ Kind = 'package'; Top = ''; HasPack = $rootPack } }
         if ($innerZips.Count -eq 1) { return @{ Kind = 'outer'; Inner = $innerZips[0] } }
         return @{ Kind = 'other' }
     } finally {
@@ -321,7 +429,7 @@ function Wait-ForDownload([string]$Dir) {
         }
         if (((Get-Date) - $lastReport).TotalSeconds -ge 20) {
             $lastReport = Get-Date
-            $msg = '  still waiting ({0:mm\:ss})' -f ((Get-Date) - $start)
+            $msg = '  still waiting (' + (Format-Elapsed ((Get-Date) - $start)) + ')'
             $busy = @(Get-ChildItem -LiteralPath $Dir -ErrorAction SilentlyContinue |
                 Where-Object { -not $_.PSIsContainer -and $_.LastWriteTime -ge $start -and
                                ($_.Extension -eq '.crdownload' -or $_.Extension -eq '.part' -or
@@ -343,6 +451,8 @@ function Wait-ForDownload([string]$Dir) {
                 Say '    click the newest run with a green tick and download'
                 Say '    PoseAssess_Portable_win64 under "Artifacts" at the bottom of that page.'
                 Say "  This script keeps waiting for the zip in $Dir."
+                Say '  (Saved it somewhere else? Close this window and run the script again: it'
+                Say '   then lets you type or drag in the file.)'
                 Say ''
             }
         }
@@ -363,27 +473,40 @@ $OpenPoseDir = ''
 if (-not $NoPack) {
     Step '1/4  OpenPose on this PC'
     if ($OpenPose) {
-        $OpenPoseDir = $OpenPose.Trim().Trim('"').TrimEnd('\')
+        $OpenPoseDir = Resolve-OpenPoseRoot $OpenPose
     } else {
-        foreach ($c in @('C:\openpose', 'D:\openpose', (PathJoin $env:USERPROFILE 'openpose'))) {
-            if (Test-OpenPoseDir $c) { $OpenPoseDir = $c; break }
+        $firstBad = ''
+        foreach ($c in @('C:\openpose', 'D:\openpose', (PathJoin $env:USERPROFILE 'openpose'), (Get-RememberedOpenPose))) {
+            if (-not $c) { continue }
+            $r = Resolve-OpenPoseRoot $c
+            if (-not (Test-Path -LiteralPath $r -PathType Container)) { continue }
+            # not the openpose copy inside a PoseAssess folder (an earlier internal package)
+            if (Test-Path -LiteralPath (PathJoin ([System.IO.Path]::GetDirectoryName($r)) 'run.bat')) { continue }
+            if (@(Get-OpenPoseProblems $r).Count -eq 0) { $OpenPoseDir = $r; break }
+            if (-not $firstBad) { $firstBad = $r }
         }
+        if (-not $OpenPoseDir) { $OpenPoseDir = $firstBad }
     }
     while ($true) {
-        $problem = ''
         if (-not $OpenPoseDir) {
-            Say '  OpenPose not found in C:\openpose, D:\openpose or your user folder.'
-        } elseif (-not (Test-OpenPoseDir $OpenPoseDir)) {
-            Show-OpenPoseProblem $OpenPoseDir
+            Say '  OpenPose not found (looked in C:\openpose, D:\openpose, your user folder and the'
+            Say '  folder PoseAssess remembers).'
         } else {
-            $problem = Get-PathProblem $OpenPoseDir $false
-            if (-not $problem) { break }
-            Say "  Cannot use $OpenPoseDir : $problem. Move OpenPose to e.g. C:\openpose."
+            $problems = @(Get-OpenPoseProblems $OpenPoseDir)
+            if ($problems.Count -eq 0) {
+                $pp = Get-PathProblem $OpenPoseDir $false
+                if (-not $pp) { break }
+                $problems = @("$pp - move OpenPose to e.g. C:\openpose")
+            }
+            Say "  Cannot use OpenPose in $OpenPoseDir :"
+            foreach ($p in $problems) { Say "    - $p" }
         }
-        $OpenPoseDir = (Read-Answer 'OpenPose folder (e.g. C:\openpose), or press Enter to quit').TrimEnd('\')
-        if (-not $OpenPoseDir) { Stop-Script 'No OpenPose folder - nothing done.' }
+        Say '  (PoseAssess > 1. Project > "Get OpenPose..." can download and set up OpenPose.)'
+        $typed = Read-Answer 'OpenPose folder (e.g. C:\openpose), or press Enter to quit'
+        if (-not $typed) { Stop-Script 'No OpenPose folder - nothing done.' }
+        $OpenPoseDir = Resolve-OpenPoseRoot $typed
     }
-    Say "  OpenPose: $OpenPoseDir  (BODY_25B files present)"
+    Say "  OpenPose: $OpenPoseDir  (GPU build, BODY_25B files present)"
 }
 
 # --- 2. Where PoseAssess goes --------------------------------------------------------
@@ -401,9 +524,11 @@ if ($Dest) {
 }
 while ($true) {
     $problem = ''
+    $madeDirs = @()
     try { $DestRoot = [System.IO.Path]::GetFullPath($DestRoot) } catch { $problem = 'not a valid folder path' }
     if (-not $problem) { $problem = Get-PathProblem $DestRoot $true }
     if (-not $problem) {
+        $madeDirs = @(Get-MissingDirs $DestRoot)
         try {
             [void][System.IO.Directory]::CreateDirectory($DestRoot)
             $probe = PathJoin $DestRoot ('_poseassess_write_test_' + [guid]::NewGuid().ToString('N') + '.tmp')
@@ -426,11 +551,30 @@ while ($true) {
     } else {
         Say "  Cannot use $DestRoot : $problem"
     }
+    Remove-OwnEmptyDirs $madeDirs
     $DestRoot = Read-Answer 'Folder to put PoseAssess in (e.g. D:\ or E:\Tools), or press Enter to quit'
     if (-not $DestRoot) { Stop-Script 'Nothing done.' }
     if ($DestRoot -match '^[A-Za-z]:$') { $DestRoot += '\' }
 }
 $Final = PathJoin $DestRoot $DefaultName
+
+# One copy of this script per place at a time (the lock file goes away when it ends).
+$lockPath = PathJoin $DestRoot $LockName
+try {
+    $Lock = New-Object -TypeName System.IO.FileStream -ArgumentList @(
+        $lockPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite,
+        [System.IO.FileShare]::None, 4096, [System.IO.FileOptions]::DeleteOnClose)
+} catch {
+    Stop-Script "Another copy of this script is working in $DestRoot. Let it finish (or close it) and run this again."
+}
+
+# Leftovers of an interrupted earlier run (this script's own temporary names only).
+foreach ($l in @(Get-ChildItem -LiteralPath $DestRoot -Force -ErrorAction SilentlyContinue | Where-Object {
+        ($_.PSIsContainer -and $_.Name -like ($StagePrefix + '*')) -or
+        (-not $_.PSIsContainer -and $_.Name -like ($TempZipPrefix + '*.zip')) })) {
+    Say "  Removing a leftover of an interrupted earlier run: $($l.FullName)"
+    Remove-Item -LiteralPath $l.FullName -Recurse -Force -ErrorAction SilentlyContinue
+}
 
 # Where the lab package goes (checked now, not after the long unzip).
 $resultZip = PathJoin $DestRoot ($DefaultName + $OutSuffix)
@@ -458,24 +602,25 @@ Step '3/4  Download and unzip PoseAssess'
 $skipUnzip = $false
 $renameOld = $false
 if (Test-Path -LiteralPath $Final) {
-    $incomplete = Test-Path -LiteralPath (PathJoin $Final $Marker)
-    if ($incomplete) {
-        Say "  $Final exists, but an earlier unzip into it did not finish."
+    $oldBuild = (-not $NoPack) -and -not (Test-Path -LiteralPath (PathJoin $Final 'pack_with_openpose.bat'))
+    if ($oldBuild) {
+        Say "  $Final already exists, but it is an older PoseAssess build"
+        Say '  (no pack_with_openpose.bat), so it cannot make the OpenPose package.'
         $choices = 'R / Q'
     } else {
         Say "  $Final already exists."
         Say '    [U] use it as it is (no download, no unzip)'
         $choices = 'U / R / Q'
     }
-    Say "    [R] rename it to ${DefaultName}_old_<date> (once the new download is checked) and"
-    Say '        unzip a fresh copy'
+    Say '    [R] unzip a fresh copy; once it is complete, the existing folder is renamed to'
+    Say "        ${DefaultName}_old_<date> (nothing in it is changed or deleted)"
     Say '    [Q] quit'
     if ($Yes) {
-        if ($incomplete) { Say '  -Yes: [R]'; $renameOld = $true } else { Say '  -Yes: [U]'; $skipUnzip = $true }
+        if ($oldBuild) { Say '  -Yes: [R]'; $renameOld = $true } else { Say '  -Yes: [U]'; $skipUnzip = $true }
     }
     while (-not $skipUnzip -and -not $renameOld) {
         $a = (Read-Answer $choices).ToUpper()
-        if ($a -eq 'U' -and -not $incomplete) { $skipUnzip = $true }
+        if ($a -eq 'U' -and -not $oldBuild) { $skipUnzip = $true }
         elseif ($a -eq 'R') { $renameOld = $true }
         elseif ($a -eq 'Q') { Stop-Script 'Nothing changed.' }
     }
@@ -485,8 +630,8 @@ if (-not $skipUnzip) {
     # 3a. the downloaded zip
     $zipFile = ''
     if ($Zip) {
-        $zipFile = $Zip.Trim().Trim('"')
-        if (-not (Test-Path -LiteralPath $zipFile -PathType Leaf)) { Stop-Script "No such file: $zipFile" }
+        $zipFile = Resolve-ZipInput $Zip
+        if (-not $zipFile) { Stop-Script "-Zip $Zip : no such file (and no $ZipPattern in such a folder)." }
     } else {
         $downloads = Get-DownloadsDir
         $found = @(Find-PackageZips $downloads)
@@ -499,16 +644,17 @@ if (-not $skipUnzip) {
             Say ''
             Say 'If you already downloaded PoseAssess_Portable_win64.zip to another folder, type its'
             Say 'full path (or drag the file into this window) and press Enter.'
-            if ($Yes) { $typed = '' } else { $typed = Read-Answer 'Otherwise just press Enter to download it now' }
-            if ($typed) {
-                if (-not (Test-Path -LiteralPath $typed -PathType Leaf)) { Stop-Script "No such file: $typed" }
-                $zipFile = $typed
-            } else {
-                $zipFile = Wait-ForDownload $downloads
+            while (-not $zipFile) {
+                if ($Yes) { $typed = '' } else { $typed = Read-Answer 'Otherwise just press Enter to download it now' }
+                if (-not $typed) {
+                    $zipFile = Wait-ForDownload $downloads
+                } else {
+                    $zipFile = Resolve-ZipInput $typed
+                    if (-not $zipFile) { Say "  Not found: $typed  (give the .zip file, or a folder that holds $ZipPattern)" }
+                }
             }
         }
     }
-    $zipFile = [System.IO.Path]::GetFullPath($zipFile)
     $state = Get-ZipState $zipFile
     if ($state -eq 'broken') {
         Stop-Script "$zipFile is not a readable zip (download incomplete or broken?). Delete it and download again."
@@ -518,18 +664,21 @@ if (-not $skipUnzip) {
                      'Wait a minute and run this script again.')
     }
 
-    # 3b-3c. take the package zip out of the GitHub download if needed, check it, then
-    # (only now) rename an old folder and unzip. One try/finally: the temporary zip and a
-    # failed unzip of our own are always removed.
+    # 3b-3c. Take the package zip out of the GitHub download if needed and check it; unzip
+    # into a new folder of our own (_pa_unzip_<time>) next to PoseAssess_Portable; only
+    # when that is complete, rename an old folder ([R]) and the new one into place. One
+    # try/finally: the temporary zip and an unfinished unzip folder are always removed.
     $tempInner = ''
-    $created = $false
+    $stage = ''
+    $stageMade = $false
+    $renamedOldTo = ''
     $ok = $false
     $fail = ''
     try {
         $kind = Get-ZipKind $zipFile
         $packageZip = $zipFile
         if ($kind.Kind -eq 'outer') {
-            $tempInner = PathJoin $DestRoot ('_poseassess_download_' + (Get-Date -Format 'yyyyMMdd_HHmmss') + '.zip')
+            $tempInner = PathJoin $DestRoot ($TempZipPrefix + (Get-Date -Format 'yyyyMMdd_HHmmss') + '.zip')
             Say "  Taking $($kind.Inner) out of the GitHub download..."
             $z = [System.IO.Compression.ZipFile]::OpenRead($zipFile)
             try {
@@ -540,36 +689,50 @@ if (-not $skipUnzip) {
             $packageZip = $tempInner
             $kind = Get-ZipKind $packageZip
         }
-        if ($kind.Kind -ne 'package') { $fail = "$zipFile is not a PoseAssess package (no run.bat inside)." }
-
+        if ($kind.Kind -ne 'package') {
+            $fail = "$zipFile is not a PoseAssess package (no run.bat inside)."
+        } elseif (-not $NoPack -and -not $kind.HasPack) {
+            $fail = ("$zipFile is an older PoseAssess build (no pack_with_openpose.bat inside). " +
+                     "Download the current build: run this script again and answer n to 'Use this " +
+                     "file?' (or delete that zip), or get it from $BuildsUrl")
+        }
         $prefix = ''
         if (-not $fail -and $kind.Top) { $prefix = $kind.Top + '/' }
         if (-not $fail) {
-            $longest = $Final.Length + 1 + (Get-LongestName $packageZip $prefix)
-            Say "  Longest path after unzipping: $longest characters (Windows limit: $MaxPath)"
-            if ($longest -gt $MaxPath) {
-                $fail = ("$Final is too deep for Windows path length limits: choose a shorter " +
+            $stage = PathJoin $DestRoot ($StagePrefix + (Get-Date -Format 'yyyyMMdd_HHmmss'))
+            $deepest = [Math]::Max($Final.Length, $stage.Length) + 1 + (Get-LongestName $packageZip $prefix)
+            Say "  Longest path after unzipping: $deepest characters (Windows limit: $MaxPath)"
+            if ($deepest -gt $MaxPath) {
+                $fail = ("$DestRoot is too deep for Windows path length limits: choose a shorter " +
                          'folder, e.g. D:\ (-Dest D:\).')
-            }
-        }
-        if (-not $fail -and $renameOld) {
-            $old = $DefaultName + '_old_' + (Get-Date -Format 'yyyyMMdd_HHmmss')
-            try {
-                Rename-Item -LiteralPath $Final -NewName $old
-                Say "  Renamed the old folder to $(PathJoin $DestRoot $old)"
-            } catch {
-                $fail = ("Cannot rename $Final (is PoseAssess or a file in it still open? Close it " +
-                         "and run this script again): $($_.Exception.Message)")
+            } elseif (Test-Path -LiteralPath $stage) {
+                $fail = "$stage already exists - run this script again."
             }
         }
         if (-not $fail) {
-            [void][System.IO.Directory]::CreateDirectory($Final)
-            $created = $true
-            [System.IO.File]::WriteAllText((PathJoin $Final $Marker), 'Unzip by get_poseassess_with_openpose.ps1 not finished.')
-            Say "  Unzipping to $Final  (a few minutes)..."
-            Expand-Package $packageZip $prefix $Final
-            Remove-Item -LiteralPath (PathJoin $Final $Marker) -Force
-            $ok = $true
+            [void][System.IO.Directory]::CreateDirectory($stage)
+            $stageMade = $true
+            Say "  Unzipping to $stage  (a few minutes)..."
+            Expand-Package $packageZip $prefix $stage
+            if ($renameOld -and (Test-Path -LiteralPath $Final)) {
+                $old = $DefaultName + '_old_' + (Get-Date -Format 'yyyyMMdd_HHmmss')
+                try {
+                    Rename-WithRetry $Final $old
+                    $renamedOldTo = PathJoin $DestRoot $old
+                    Say "  Renamed the previous folder to $renamedOldTo"
+                } catch {
+                    $fail = ("Cannot rename $Final (is PoseAssess or a file in it still open? Close " +
+                             "it and run this script again): $($_.Exception.Message)")
+                }
+            }
+            if (-not $fail -and (Test-Path -LiteralPath $Final)) {
+                $fail = ("$Final appeared while this script was running; nothing in it was changed. " +
+                         'Rename or remove it and run this script again.')
+            }
+            if (-not $fail) {
+                Rename-WithRetry $stage $DefaultName
+                $ok = $true
+            }
         }
     } catch {
         $fail = "Unzipping failed: $($_.Exception.Message)"
@@ -577,11 +740,19 @@ if (-not $skipUnzip) {
         if ($tempInner -and (Test-Path -LiteralPath $tempInner)) {
             Remove-Item -LiteralPath $tempInner -Force -ErrorAction SilentlyContinue
         }
-        if ($created -and -not $ok -and (Test-Path -LiteralPath $Final)) {
-            Say "  Removing the incomplete $Final ..."
-            Remove-Item -LiteralPath $Final -Recurse -Force -ErrorAction SilentlyContinue
-            if (Test-Path -LiteralPath $Final) {
-                Say "  Could not remove all of $Final - delete it by hand (it is marked incomplete)."
+        if ($stageMade -and -not $ok -and (Test-Path -LiteralPath $stage)) {
+            Say "  Removing the unfinished $stage ..."
+            Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+            if (Test-Path -LiteralPath $stage) {
+                Say "  Could not remove all of $stage - the next run of this script removes it."
+            }
+        }
+        if ($renamedOldTo -and -not $ok -and -not (Test-Path -LiteralPath $Final)) {
+            try {
+                Rename-WithRetry $renamedOldTo $DefaultName
+                Say "  Your previous folder is back at $Final"
+            } catch {
+                Say "  Your previous folder is at $renamedOldTo"
             }
         }
     }
@@ -589,9 +760,6 @@ if (-not $skipUnzip) {
     Say "  Done: $Final"
 }
 
-if (Test-Path -LiteralPath (PathJoin $Final $Marker)) {
-    Stop-Script "An earlier unzip into $Final did not finish. Run again and choose [R]."
-}
 foreach ($need in @('run.bat', 'python311\python.exe', 'venv\Scripts\python.exe')) {
     if (-not (Test-Path -LiteralPath (PathJoin $Final $need))) {
         Stop-Script "$Final is incomplete: $need is missing. Run again and choose [R] for a fresh copy."
@@ -608,7 +776,7 @@ if ($NoPack) {
 Step '4/4  Make the internal package with OpenPose'
 $packBat = PathJoin $Final 'pack_with_openpose.bat'
 if (-not (Test-Path -LiteralPath $packBat)) {
-    Stop-Script "$packBat is missing: this is an older PoseAssess build. Run again and choose [R] to unzip the current download."
+    Stop-Script "$packBat is missing: this is an older PoseAssess build. Run again and choose [R]."
 }
 Say "  Running $packBat"
 if ($Yes) {
