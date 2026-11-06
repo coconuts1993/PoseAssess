@@ -41,8 +41,8 @@ param(
     [string]$OutZip = '',
     [switch]$NoPack,
     [switch]$Yes,
-    # The build of 2026-11-05 (GitHub keeps it for 30 days, until 2026-12-05).
-    [string]$ArtifactUrl = 'https://github.com/coconuts1993/PoseAssess/actions/runs/42029741982/artifacts/13415702734',
+    # The build of 2026-11-06 (GitHub keeps it for 30 days, until 2026-12-06).
+    [string]$ArtifactUrl = 'https://github.com/coconuts1993/PoseAssess/actions/runs/42172708068/artifacts/13482078730',
     [string]$BuildsUrl = 'https://github.com/coconuts1993/PoseAssess/actions/workflows/build-portable.yml',
     [int]$WaitMinutes = 120
 )
