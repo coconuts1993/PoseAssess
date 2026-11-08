@@ -116,6 +116,8 @@ class Pipeline:
             "openpose_dir": (self._openpose_dir() if backend == "openpose"
                              else self.project.config.openpose_dir),
         }
+        if backend == "openpose":
+            opts["net_resolution"] = self._openpose_net_resolution()
         be = base.get_pose2d_backend(backend, **opts)
         avail, why = be.is_available()
         if not avail:
@@ -141,6 +143,18 @@ class Pipeline:
                 vid, out_dir, camera_index=i,
                 progress=lambda f, t, m: self._log(f"  {m}") if log_all or f % 50 == 0 else None,
             )
+
+    def _openpose_net_resolution(self) -> str:
+        """The project's OpenPose --net_resolution (1. Project), else the default."""
+        from poseassess.core import openpose_setup as ops
+        raw = getattr(self.project.config, "openpose_net_resolution", "") or ""
+        value = ops.normalize_net_resolution(raw)
+        if value is None:
+            if str(raw).strip():
+                self._log(f"[pose:openpose] network resolution {raw!r} is not usable "
+                          f"(-1xH, H a multiple of 16): using {ops.NET_RESOLUTION}")
+            value = ops.NET_RESOLUTION
+        return value
 
     def _openpose_dir(self) -> str:
         """The local OpenPose install to run: the project setting, the folder remembered

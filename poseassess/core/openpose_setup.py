@@ -23,7 +23,8 @@ BODY_25B layout inside the install root (OpenPose looks for these EXACT names)::
     models/pose/body_25b/pose_iter_XXXXXX.caffemodel
 
 Run it with the install root as working directory (or ``--model_folder
-<root>/models/``) and ``--model_pose BODY_25B --net_resolution -1x480``.
+<root>/models/``) and ``--model_pose BODY_25B --net_resolution -1x368`` (OpenPose's own
+default; ``NET_RESOLUTIONS`` lists the choices on 1. Project).
 
 Qt-free: the GUI runs the slow functions in a worker thread.
 """
@@ -35,6 +36,7 @@ import http.client
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import urllib.error
@@ -60,7 +62,35 @@ OFFICIAL_ZIP_SHA256 = "82ecf470c81b001d1b34873081c0157821c75a0557d926c7427f688d5
 OFFICIAL_UNPACKED_SIZE = 994_329_639
 LICENSE_URL = "https://github.com/CMU-Perceptual-Computing-Lab/openpose/blob/master/LICENSE"
 
-NET_RESOLUTION = "-1x480"
+#: OpenPose's own default network resolution. CMU suggests -1x480 for BODY_25B, but that
+#: needs more than 11 GB of GPU memory: on a GTX 1080 Ti (11 GB) it spills into shared memory
+#: and runs at 0.9 fps instead of 16 fps at -1x368 (measured by a user).
+NET_RESOLUTION = "-1x368"
+#: Choices offered on 1. Project: (value, label).
+NET_RESOLUTIONS = (
+    ("-1x368", "368 \u00b7 OpenPose default, fast (recommended)"),
+    ("-1x480", "480 \u00b7 more detail; needs a GPU with more than 11 GB"),
+    ("-1x256", "256 \u00b7 fastest, least detail"),
+)
+_NET_RESOLUTION_RE = re.compile(r"^\s*-1\s*x\s*(\d+)\s*$", re.IGNORECASE)
+
+
+def normalize_net_resolution(value: object) -> str | None:
+    """``"-1xH"`` for a usable OpenPose ``--net_resolution`` (H a multiple of 16 in
+    128..1024, as OpenPose needs), None otherwise ("" / None -> None)."""
+    m = _NET_RESOLUTION_RE.match(str(value or ""))
+    if not m:
+        return None
+    h = int(m.group(1))
+    if h % 16 or not 128 <= h <= 1024:
+        return None
+    return f"-1x{h}"
+
+
+def net_resolution_or_default(value: object) -> str:
+    """`normalize_net_resolution`, falling back to `NET_RESOLUTION`."""
+    return normalize_net_resolution(value) or NET_RESOLUTION
+
 MODEL_POSE = "BODY_25B"
 MODEL_SUBDIR = Path("models", "pose", "body_25b")
 CAFFEMODEL_NAME = "pose_iter_XXXXXX.caffemodel"

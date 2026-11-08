@@ -73,6 +73,7 @@ class ProjectConfig:
 
     # Optional external tool paths (filled in by the user in settings).
     openpose_dir: str = ""         # folder containing OpenPoseDemo.exe
+    openpose_net_resolution: str = ""  # OpenPose --net_resolution, "" = default (-1x368)
     opensim_cmd: str = ""          # path to opensim-cmd.exe
     osim_model: str = ""           # path to the .osim model file
 

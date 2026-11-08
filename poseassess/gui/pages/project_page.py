@@ -201,6 +201,22 @@ class ProjectPage(BasePage):
         h.addWidget(browse)
         h.addWidget(get)
         v.addLayout(h)
+        res = QHBoxLayout()
+        res.addWidget(QLabel("Network resolution"))
+        self.openpose_res_combo = QComboBox()
+        self.openpose_res_combo.setObjectName("openposeNetResolution")
+        for value, label in ops.NET_RESOLUTIONS:
+            self.openpose_res_combo.addItem(label, value)
+        self.openpose_res_combo.setSizeAdjustPolicy(
+            QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.openpose_res_combo.setMinimumContentsLength(8)  # never widens the page
+        self.openpose_res_combo.setToolTip(
+            "OpenPose --net_resolution. 368 is OpenPose's own default and the usual choice. "
+            "480 (CMU's suggestion for BODY_25B) sees small or distant people a little better "
+            "but needs a GPU with more than 11 GB of memory: on an 11 GB GTX 1080 Ti it runs "
+            "at about 1 fps instead of 16 fps. Use the same setting for all trials you compare.")
+        res.addWidget(self.openpose_res_combo, 1)
+        v.addLayout(res)
         self.openpose_status = QLabel()
         self.openpose_status.setWordWrap(True)
         self.openpose_status.setTextFormat(Qt.RichText)
@@ -209,6 +225,20 @@ class ProjectPage(BasePage):
         self.openpose_status.setSizePolicy(sp)
         v.addWidget(self.openpose_status)
         return row
+
+    # ---- OpenPose network resolution ----
+    def _openpose_res_setting(self) -> str:
+        return ops.net_resolution_or_default(self.openpose_res_combo.currentData())
+
+    def _set_openpose_res(self, value: str) -> None:
+        """Select `value` ("" or unusable: the default); a usable value that is not one of
+        the presets (e.g. typed into project.toml) is added as its own item."""
+        v = ops.net_resolution_or_default(value)
+        i = self.openpose_res_combo.findData(v)
+        if i < 0:
+            self.openpose_res_combo.addItem(f"{v.split('x', 1)[1]} \u00b7 from project.toml", v)
+            i = self.openpose_res_combo.count() - 1
+        self.openpose_res_combo.setCurrentIndex(i)
 
     # ---- OpenPose folder ----
     def _openpose_shown(self) -> bool:
@@ -418,6 +448,7 @@ class ProjectPage(BasePage):
             frame_rate=self.fps_spin.value(),
             pose2d_backend=self.backend_combo.currentData(),
             openpose_dir=self._openpose_setting(),
+            openpose_net_resolution=self._openpose_res_setting(),
             checkerboard=CheckerboardConfig(
                 corners_nb=[self.corners_h.value(), self.corners_w.value()],
                 square_size=self.square.value(),
@@ -465,6 +496,7 @@ class ProjectPage(BasePage):
         c.frame_rate = self.fps_spin.value()
         c.pose2d_backend = self.backend_combo.currentData()
         c.openpose_dir = self._openpose_setting()
+        c.openpose_net_resolution = self._openpose_res_setting()
         c.checkerboard = CheckerboardConfig(
             corners_nb=[self.corners_h.value(), self.corners_w.value()],
             square_size=self.square.value(),
@@ -486,6 +518,7 @@ class ProjectPage(BasePage):
         self.cameras_spin.setValue(c.num_cameras)
         self.fps_spin.setValue(c.frame_rate)
         self.openpose_edit.setText(c.openpose_dir or "")
+        self._set_openpose_res(getattr(c, "openpose_net_resolution", ""))
         i = self.backend_combo.findData(c.pose2d_backend)
         if i >= 0:
             self.backend_combo.setCurrentIndex(i)

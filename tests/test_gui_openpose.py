@@ -1114,3 +1114,47 @@ def test_exit_waits_for_a_stopping_download(tmp_path):
     assert "Destroyed while thread" not in proc.stderr
     assert "Stopping the cancelled OpenPose download" in proc.stderr
     assert marker.read_text() == "partial files removed"
+
+
+# --------------------------------------------------------------------------- #
+# network resolution (OpenPose row)
+# --------------------------------------------------------------------------- #
+def test_resolution_choice_default_save_load_and_create(page, project, tmp_path):
+    from poseassess.core.project import Project
+
+    combo = page.openpose_res_combo
+    assert combo.currentData() == ops.NET_RESOLUTION == "-1x368"
+    assert [combo.itemData(i) for i in range(combo.count())] == [v for v, _ in ops.NET_RESOLUTIONS]
+    assert combo.parent() is not None and page.openpose_row.isAncestorOf(combo)  # hidden with it
+
+    page.state.set_project(project)
+    select_backend(page, "openpose")
+    combo.setCurrentIndex(combo.findData("-1x480"))
+    page._save()
+    assert Project.load(project.root).config.openpose_net_resolution == "-1x480"
+
+    # loading: the project's value; "" (older project) -> the default
+    project.config.openpose_net_resolution = ""
+    page.state.set_project(project)
+    assert combo.currentData() == "-1x368"
+    project.config.openpose_net_resolution = "-1x480"
+    page.state.set_project(project)
+    assert combo.currentData() == "-1x480"
+
+    # a usable value that is not a preset is kept as its own item; an unusable one -> default
+    n = combo.count()
+    project.config.openpose_net_resolution = "-1x320"
+    page.state.set_project(project)
+    assert combo.currentData() == "-1x320" and combo.count() == n + 1
+    assert "320" in combo.currentText()
+    page._save()
+    assert Project.load(project.root).config.openpose_net_resolution == "-1x320"
+    project.config.openpose_net_resolution = "-1x333"
+    page.state.set_project(project)
+    assert combo.currentData() == "-1x368"
+
+    # a new project gets the choice too
+    combo.setCurrentIndex(combo.findData("-1x256"))
+    page.path_edit.setText(str(tmp_path / "newproj"))
+    page._create()
+    assert Project.load(tmp_path / "newproj").config.openpose_net_resolution == "-1x256"

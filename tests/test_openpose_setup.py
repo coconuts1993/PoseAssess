@@ -694,7 +694,7 @@ def test_official_release_constants():
     assert ops.MODEL_SUBDIR == Path("models", "pose", "body_25b")
     assert ops.CAFFEMODEL_NAME == "pose_iter_XXXXXX.caffemodel"
     assert ops.PROTOTXT_NAME == "pose_deploy.prototxt"
-    assert (ops.MODEL_POSE, ops.NET_RESOLUTION) == ("BODY_25B", "-1x480")
+    assert (ops.MODEL_POSE, ops.NET_RESOLUTION) == ("BODY_25B", "-1x368")
     raw = ("https://raw.githubusercontent.com/CMU-Perceptual-Computing-Lab/openpose_train/"
            "master/experimental_models")
     expected = {

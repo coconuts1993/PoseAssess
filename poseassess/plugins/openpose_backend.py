@@ -39,7 +39,7 @@ from ..core import openpose_setup as ops
 from .base import Pose2DBackend, Pose2DResult, ProgressFn, register_pose2d
 
 MODEL_POSE = ops.MODEL_POSE              # "BODY_25B"
-NET_RESOLUTION = ops.NET_RESOLUTION      # "-1x480", CMU's setting for BODY_25B
+NET_RESOLUTION = ops.NET_RESOLUTION      # "-1x368", OpenPose's default (see openpose_setup)
 TAIL_LINES = 20        # output lines quoted when OpenPose fails
 _POLL_S = 0.25         # how often the loop wakes up when OpenPose prints nothing
 _REPORT_S = 1.0        # frame progress at most this often
@@ -70,7 +70,7 @@ class OpenPoseBackend(Pose2DBackend):
         return str(self.options.get("model_pose") or MODEL_POSE)
 
     def _net_resolution(self) -> str:
-        return str(self.options.get("net_resolution") or NET_RESOLUTION)
+        return ops.net_resolution_or_default(self.options.get("net_resolution"))
 
     def is_available(self) -> tuple[bool, str]:
         """(usable, why not); slow like `resolve`, so not on the GUI thread."""
@@ -237,10 +237,44 @@ def _frame_count(video: str | Path) -> Optional[int]:
     return n if n > 0 else None
 
 
-def _frames_text(tag: str, done: int, total: Optional[int]) -> str:
-    if total:
-        return f"{tag}: {done}/{total} frames ({min(100, 100 * done // total)}%)"
-    return f"{tag}: {done} frames"
+def _frames_text(tag: str, done: int, total: Optional[int],
+                 fps: Optional[float] = None) -> str:
+    """'camNN: done/total frames (p%)', plus the speed and the time left when known."""
+    text = (f"{tag}: {done}/{total} frames ({min(100, 100 * done // total)}%)" if total
+            else f"{tag}: {done} frames")
+    if fps and fps > 0:
+        text += f", {fps:.1f} fps"
+        if total and total > done:
+            text += f", about {_duration_text((total - done) / fps)} left"
+    return text
+
+
+def _duration_text(seconds: float) -> str:
+    s = max(0, int(round(seconds)))
+    if s < 60:
+        return f"{s} s"
+    m = (s + 30) // 60
+    if m < 60:
+        return f"{m} min"
+    return f"{m // 60} h {m % 60:02d} min"
+
+
+class _Speed:
+    """Frames per second over the last `window_s` seconds (OpenPose's start-up time, before
+    the first frame, is not counted)."""
+
+    def __init__(self, window_s: float = 10.0):
+        self.window_s = window_s
+        self._samples: deque = deque()
+
+    def add(self, t: float, done: int) -> Optional[float]:
+        self._samples.append((t, done))
+        while len(self._samples) > 2 and t - self._samples[1][0] >= self.window_s:
+            self._samples.popleft()
+        t0, d0 = self._samples[0]
+        if t - t0 <= 0 or done <= d0:
+            return None
+        return (done - d0) / (t - t0)
 
 
 # Windows status codes a crashed OpenPoseDemo.exe typically exits with
@@ -345,6 +379,7 @@ def _run_openpose(cmd: list[str], cwd: Path, json_dir: Path, total: Optional[int
         done = 0
         last_report = window = time.monotonic()
         shown = hidden = 0
+        speed = _Speed()
         while True:
             try:
                 line = lines.get(timeout=_POLL_S)
@@ -368,8 +403,10 @@ def _run_openpose(cmd: list[str], cwd: Path, json_dir: Path, total: Optional[int
                 last_report = now
                 n = _count_keypoint_files(json_dir)
                 if n > done:
+                    if done == 0:
+                        speed.add(now, 0)  # the first frames: start of the speed window
                     done = n
-                    report(done, total, _frames_text(tag, done, total))
+                    report(done, total, _frames_text(tag, done, total, speed.add(now, done)))
         if hidden:
             report(done, total, _hidden_text(tag, hidden))
         code = proc.wait()

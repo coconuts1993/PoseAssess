@@ -168,7 +168,7 @@ def test_happy_path_renames_frames_reports_progress_and_runs_in_root(
     cmd = call["cmd"]
     assert cmd[0] == str(root / "bin" / ops.EXE_NAME)
     assert arg(cmd, "--model_pose") == "BODY_25B"
-    assert arg(cmd, "--net_resolution") == "-1x480"
+    assert arg(cmd, "--net_resolution") == "-1x368"  # OpenPose's own default
     assert arg(cmd, "--display") == "0" and arg(cmd, "--render_pose") == "0"
     assert arg(cmd, "--video") == str(video)
     assert arg(cmd, "--write_json") == str(out / ob._WORK_DIR)  # moved to out on success

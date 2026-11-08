@@ -277,6 +277,13 @@ Setup:
    the line says so: "... is not ready (...); using C:\openpose instead".
    The line also warns about an unsupported GPU / driver.
    A folder that checks OK is remembered on this PC for every project.
+4. "Network resolution" (under the OpenPose folder): 368 is OpenPose's own
+   default (also what OpenPoseDemo.exe uses when run by hand) and the usual
+   choice. 480 (CMU's suggestion for BODY_25B) sees small or distant people
+   a little better but needs a GPU with MORE than 11 GB of memory: on an
+   11 GB GTX 1080 Ti it runs at about 1 fps instead of 16 fps. Use the same
+   setting for all trials you compare. The Run page shows the speed (fps)
+   and the time left for each camera.
 
 Lab PCs: use the INTERNAL package made with pack_with_openpose.bat (see
 INTERNAL LAB PACKAGE WITH OPENPOSE below): PoseAssess together with the
