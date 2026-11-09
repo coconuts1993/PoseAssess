@@ -476,6 +476,7 @@ class CapturePage(BasePage):
         else:
             self._settings = load_capture_settings(project)
             self._session = CaptureSession(project, self._settings)
+            self.state.capture_session = self._session  # "3c. Live 3D" reuses its cameras
         self._load_settings_ui()
         self._refresh_takes()
         self._update_controls()
@@ -483,6 +484,8 @@ class CapturePage(BasePage):
     def _close_session(self, reason: str = "") -> None:
         s = self._session
         self._session = None
+        if getattr(self.state, "capture_session", None) is s:
+            self.state.capture_session = None
         if s is None:
             return
         folder = None

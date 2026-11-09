@@ -30,6 +30,9 @@ class AppState(QObject):
         self._project: Optional[Project] = None
         self._wii = None
         self._busy: dict[str, str] = {}
+        # The CaptureSession of "3b. Capture" (set by that page): "3c. Live 3D" streams from its
+        # cameras when they are open there (a webcam cannot be opened twice).
+        self.capture_session = None
 
     @property
     def project(self) -> Optional[Project]:
