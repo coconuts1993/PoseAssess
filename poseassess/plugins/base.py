@@ -15,7 +15,7 @@ import abc
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Optional
+from typing import Callable, Optional
 
 
 # --------------------------------------------------------------------------- #
@@ -76,6 +76,11 @@ class Pose2DBackend(abc.ABC):
     skeleton: str = "BODY_25B"
     #: True if the backend needs a GPU to be practical.
     requires_gpu: bool = False
+    #: True if the backend limits its own `progress` calls to messages worth showing
+    #: at a bounded rate (OpenPose: frames done once a second, its output lines at
+    #: most 20 a second), so callers may log every call; False: it may be called for
+    #: every frame, callers should thin it out.
+    progress_throttled: bool = False
 
     def __init__(self, **options):
         self.options = options

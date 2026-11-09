@@ -23,6 +23,23 @@ from typing import Callable, Optional
 
 ProgressFn = Callable[[str], None]
 
+# where openpose_setup.resolve_openpose_dir found the install
+_PROJECT_SETTING = "project setting"
+_REMEMBERED = "remembered on this computer"
+
+
+def _remove_json(folder: Path) -> None:
+    """Delete the *.json files (2D results) directly in `folder`, if it exists."""
+    if not folder.is_dir():
+        return
+    for f in folder.glob("*.json"):
+        try:
+            f.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            raise RuntimeError(f"cannot remove the earlier 2D result {f}: {e}") from e
+
 
 @contextmanager
 def _in_dir(path: Path):
@@ -96,12 +113,15 @@ class Pipeline:
         from poseassess.plugins import base
         base.load_builtin_backends()
         opts = {
-            "openpose_dir": self.project.config.openpose_dir,
+            "openpose_dir": (self._openpose_dir() if backend == "openpose"
+                             else self.project.config.openpose_dir),
         }
         be = base.get_pose2d_backend(backend, **opts)
         avail, why = be.is_available()
         if not avail:
             raise RuntimeError(f"backend {backend!r} unavailable: {why}")
+        # every message of a throttled backend is worth logging; others: every 50th frame
+        log_all = getattr(be, "progress_throttled", False)
 
         videos = sorted(self.project.videos_dir.glob("*.mp4")) + \
             sorted(self.project.videos_dir.glob("*.avi")) + \
@@ -109,13 +129,38 @@ class Pipeline:
         if not videos:
             raise FileNotFoundError(f"no videos in {self.project.videos_dir}")
 
+        # Pose2Sim reads every *.json of every camNN_json folder: clear all cameras
+        # first, so a camera after a failed or cancelled one keeps no older results
+        for i in range(1, len(videos) + 1):
+            _remove_json(self.project.pose2d_cam_dir(i))
+
         for i, vid in enumerate(videos, start=1):
             out_dir = self.project.pose2d_cam_dir(i)
             self._log(f"[pose:{backend}] cam{i:02d} <- {vid.name}")
             be.process_video(
                 vid, out_dir, camera_index=i,
-                progress=lambda f, t, m: self._log(f"  {m}") if f % 50 == 0 else None,
+                progress=lambda f, t, m: self._log(f"  {m}") if log_all or f % 50 == 0 else None,
             )
+
+    def _openpose_dir(self) -> str:
+        """The local OpenPose install to run: the project setting, the folder remembered
+        on this computer or a usual place (logged); else the project setting, and the
+        backend's availability check says where it looked."""
+        from poseassess.core.openpose_setup import check_install, resolve_openpose_dir
+        setting = self.project.config.openpose_dir or ""
+        root, how = resolve_openpose_dir(setting)
+        if root is None:
+            return setting
+        if setting.strip().strip('"').strip() and how != _PROJECT_SETTING:
+            errors = check_install(setting).errors
+            self._log(f"[pose:openpose] warning: the OpenPose folder set on 1. Project "
+                      f"({setting}) is not usable: {errors[0] if errors else 'incomplete'}")
+        if how not in (_PROJECT_SETTING, _REMEMBERED):
+            how = "found in a usual place"
+        self._log(f"[pose:openpose] OpenPose at {root} ({how})")
+        for w in check_install(root).warnings:
+            self._log(f"[pose:openpose] warning: {w}")
+        return str(root)
 
     def _pose2sim_stage(self, name: str) -> StageResult:
         from Pose2Sim import Pose2Sim as ps

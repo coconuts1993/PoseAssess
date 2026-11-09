@@ -71,9 +71,17 @@ class VideosPage(BasePage):
             self.table.setItem(i - 1, 1, QTableWidgetItem(vid.name if vid.exists() else "—"))
             self.table.setItem(i - 1, 2, QTableWidgetItem("ready" if vid.exists() else "missing"))
 
+    def _export_running(self) -> bool:
+        """True (after telling the user) while 3b. Capture is replacing videos/."""
+        export = self.state.busy("export")
+        if export:
+            QMessageBox.warning(self, "Assign video", f"Wait until {export} has finished: it "
+                                "replaces the videos in videos/.")
+        return bool(export)
+
     def _assign(self):
         proj = self.state.project
-        if not proj:
+        if not proj or self._export_running():
             return
         row = self.table.currentRow()
         if row < 0:
@@ -92,7 +100,7 @@ class VideosPage(BasePage):
 
     def _assign_folder(self):
         proj = self.state.project
-        if not proj:
+        if not proj or self._export_running():
             return
         folder = QFileDialog.getExistingDirectory(
             self, "Folder with the trial videos (cam01…camNN)")

@@ -36,7 +36,7 @@ class MotionData:
 def read_mot(path: str | Path) -> MotionData:
     """Parse a .mot/.sto file into a MotionData."""
     path = Path(path)
-    lines = path.read_text().splitlines()
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
 
     header: dict = {}
     end_idx = None

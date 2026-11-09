@@ -17,7 +17,18 @@ from __future__ import annotations
 import sys
 
 
+def _utf8_streams() -> None:
+    """Write stdout / stderr as UTF-8 whatever the Windows code page (the GUI reads this
+    process's output as UTF-8; cp932 / cp1252 cannot encode many characters)."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):  # not a text stream (e.g. None, redirected)
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _utf8_streams()
     argv = argv if argv is not None else sys.argv[1:]
     if not argv:
         print("usage: pipeline_cli <project_root> [stage,stage,...] [--continue]")
@@ -38,8 +49,8 @@ def main(argv: list[str] | None = None) -> int:
     except Exception:  # noqa: BLE001
         pass
 
+    from poseassess.core.pipeline import Pipeline
     from poseassess.core.project import Project
-    from poseassess.core.pipeline import Pipeline, StageResult
 
     project = Project.load(project_root)
     pipe = Pipeline(project, progress=lambda m: print(m, flush=True))
@@ -50,7 +61,9 @@ def main(argv: list[str] | None = None) -> int:
         try:
             res = getattr(pipe, name)()
         except Exception as e:  # noqa: BLE001
-            print(f"@@STAGE_RESULT {name} FAIL {type(e).__name__}: {e}", flush=True)
+            # one line: the parent reads a marker per line (e.g. OpenPose's quoted output)
+            msg = " | ".join(s for s in str(e).splitlines() if s.strip())
+            print(f"@@STAGE_RESULT {name} FAIL {type(e).__name__}: {msg}", flush=True)
             if stop_on_error:
                 break
             continue
