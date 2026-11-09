@@ -48,6 +48,13 @@ class CheckerboardConfig:
     # add-on's `invert_extri_cal`). Use when the calibrated world comes out with Z
     # pointing DOWN, so the reconstructed subject ends up upside-down.
     invert_z: bool = False
+    # Colour of the board square diagonally inside the origin corner ("dark" or
+    # "light"; "" = not yet known). Learned the first time the operator confirms
+    # the origin on one camera, then used to place the origin automatically on
+    # the others (works for boards with one odd and one even corner count).
+    origin_square: str = ""
+    # Calibration target: "checkerboard" (default) or "charuco" (planned).
+    board_type: str = "checkerboard"
 
 
 @dataclass
@@ -90,6 +97,8 @@ class ProjectConfig:
                 corners_nb=cb.get("corners_nb", [4, 3]),
                 square_size=cb.get("square_size", 135.0),
                 invert_z=bool(cb.get("invert_z", False)),
+                origin_square=str(cb.get("origin_square", "")),
+                board_type=str(cb.get("board_type", "checkerboard")),
             )
         return cfg
 

@@ -28,6 +28,9 @@ class CornerPicker(QGraphicsView):
     """Click checkerboard corners on an image. Emits `points_changed(count)`."""
 
     points_changed = Signal(int)
+    # Emitted in the special click modes (see `start_click_mode`).
+    origin_picked = Signal(float, float)
+    four_clicked = Signal(list)
 
     def __init__(self):
         super().__init__()
@@ -49,6 +52,48 @@ class CornerPicker(QGraphicsView):
         # OFF by default: on densely-packed boards snapping can jump to the wrong
         # corner. Primary workflow is zoom + precise manual click + drag-adjust.
         self.snap_enabled: bool = False
+        # None (normal editing) | "origin" (next click names the origin corner)
+        # | "four" (collect 4 clicks on the outer corners)
+        self.click_mode: Optional[str] = None
+        self._mode_clicks: list[tuple[float, float]] = []
+        self._mode_items: list[QGraphicsEllipseItem] = []
+        # True once the operator moved/added/removed a point by hand since the
+        # last set_points() - lets the page record "auto" vs "adjusted" corners.
+        self.user_edited: bool = False
+
+    # ---- special click modes --------------------------------------------- #
+    def start_click_mode(self, mode: Optional[str]) -> None:
+        """"origin": the next click picks the origin corner (emits
+        `origin_picked`). "four": the next 4 clicks mark the outermost inner
+        corners (emits `four_clicked`). None cancels."""
+        self.click_mode = mode
+        self._mode_clicks = []
+        for it in self._mode_items:
+            if it.scene():
+                self._scene.removeItem(it)
+        self._mode_items = []
+        self.setCursor(Qt.CrossCursor if mode else Qt.ArrowCursor)
+
+    def _mode_click(self, scene_pt: QPointF) -> None:
+        if self.click_mode == "origin":
+            self.start_click_mode(None)
+            self.origin_picked.emit(float(scene_pt.x()), float(scene_pt.y()))
+            return
+        if self.click_mode == "four":
+            self._mode_clicks.append((float(scene_pt.x()), float(scene_pt.y())))
+            r = _DOT_R * 1.8
+            dot = QGraphicsEllipseItem(-r, -r, 2 * r, 2 * r)
+            dot.setPen(QPen(QColor(60, 160, 255), 2.0))
+            dot.setBrush(QBrush(Qt.NoBrush))
+            dot.setPos(scene_pt)
+            dot.setFlag(_IGNORE_TF, True)
+            dot.setZValue(14)
+            self._scene.addItem(dot)
+            self._mode_items.append(dot)
+            if len(self._mode_clicks) == 4:
+                clicks = list(self._mode_clicks)
+                self.start_click_mode(None)
+                self.four_clicked.emit(clicks)
 
     # ---- image loading ---------------------------------------------------- #
     def load_image(self, path: Path) -> bool:
@@ -107,6 +152,8 @@ class CornerPicker(QGraphicsView):
 
     def _set_pixmap(self, pix: QPixmap) -> None:
         self.clear_points()
+        self._mode_items = []          # scene.clear() below deletes them
+        self.start_click_mode(None)
         self._scene.clear()
         self._pix_item = self._scene.addPixmap(pix)
         self._img_size = (pix.width(), pix.height())
@@ -122,7 +169,12 @@ class CornerPicker(QGraphicsView):
         self.clear_points()
         for x, y in pts:
             self._add_point(QPointF(float(x), float(y)))
+        self.user_edited = False
         self.points_changed.emit(len(self._points))
+
+    def gray_image(self) -> Optional[np.ndarray]:
+        """The loaded image as grayscale (for detection / colour checks)."""
+        return self._gray
 
     def reverse_order(self) -> None:
         """Flip the corner order (origin <-> last). Fixes the 180-degree board
@@ -242,13 +294,17 @@ class CornerPicker(QGraphicsView):
         view_pt = ev.position().toPoint()
         scene_pt = self.mapToScene(view_pt)
         if ev.button() == Qt.RightButton:
+            if self.click_mode:
+                self.start_click_mode(None)
+                return
             i = self._nearest_point(scene_pt)
             if i is not None:
                 self._rebuild_without(i)
+                self.user_edited = True
             return
         if ev.button() == Qt.LeftButton:
             self._press_view = view_pt
-            i = self._nearest_point(scene_pt)
+            i = None if self.click_mode else self._nearest_point(scene_pt)
             if i is not None:
                 # grab an existing point to fine-tune it
                 self._dragging = i
@@ -276,6 +332,7 @@ class CornerPicker(QGraphicsView):
             self._dot_items[self._dragging].setPos(snapped)
             self._label_items[self._dragging].setPos(snapped)
             self._dragging = None
+            self.user_edited = True
             self.setDragMode(QGraphicsView.ScrollHandDrag)
             return
         if ev.button() == Qt.LeftButton and getattr(self, "_maybe_add", False):
@@ -285,7 +342,11 @@ class CornerPicker(QGraphicsView):
             if moved <= 4:  # a click, not a pan -> add a corner here
                 scene_pt = self.mapToScene(self._press_view)
                 if self._pix_item and self._scene.sceneRect().contains(scene_pt):
+                    if self.click_mode:
+                        self._mode_click(scene_pt)
+                        return
                     self._add_point(self._snap_corner(scene_pt))  # sub-pixel snap
+                    self.user_edited = True
                     self.points_changed.emit(len(self._points))
             return
         super().mouseReleaseEvent(ev)

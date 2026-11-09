@@ -50,10 +50,26 @@ def load_clicked_points(points_file: Path) -> np.ndarray:
     return np.asarray(pts, dtype=np.float64)
 
 
-def save_clicked_points(points_file: Path, points: Sequence[Sequence[float]]) -> None:
+def save_clicked_points(points_file: Path, points: Sequence[Sequence[float]],
+                        meta: Optional[dict] = None) -> None:
+    """Write corners as `{"points": [[x, y], ...]}`. `meta` (how the corners were
+    obtained, whether the operator reviewed them, ...) is stored alongside under
+    `"meta"`; readers that only know `"points"` ignore it."""
     points_file.parent.mkdir(parents=True, exist_ok=True)
+    data = {"points": [[float(x), float(y)] for x, y in points]}
+    if meta:
+        data["meta"] = meta
     with open(points_file, "w") as f:
-        json.dump({"points": [[float(x), float(y)] for x, y in points]}, f, indent=2)
+        json.dump(data, f, indent=2)
+
+
+def load_points_meta(points_file: Path) -> dict:
+    """The `"meta"` block written by `save_clicked_points`, or {}."""
+    try:
+        with open(points_file) as f:
+            return dict(json.load(f).get("meta") or {})
+    except (OSError, ValueError, AttributeError):
+        return {}
 
 
 def calibrate_extrinsic_camera(
