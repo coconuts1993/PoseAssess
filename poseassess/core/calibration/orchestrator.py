@@ -261,3 +261,115 @@ def _patch_calib_extrinsics(calib_toml: Path, results_by_cam: dict) -> None:
             tv = np.asarray(results_by_cam[cam_i].T, float).ravel()
             lines[k] = f"translation = [ {tv[0]}, {tv[1]}, {tv[2]},]"
     Path(calib_toml).write_text("\n".join(lines) + "\n")
+
+
+# --------------------------------------------------------------------------- #
+# Automatic extrinsic corners (version 1: plain checkerboard + operator review)
+# --------------------------------------------------------------------------- #
+VIDEO_EXTS = (".mp4", ".mov", ".avi", ".mkv", ".MP4", ".MOV")
+
+
+@dataclass
+class AutoCornersResult:
+    camera_index: int
+    ok: bool
+    points: Optional[np.ndarray] = None
+    method: str = "none"
+    frames_used: int = 0
+    frames_tried: int = 0
+    spread_px: float = 0.0
+    origin_confident: bool = False
+    origin_reason: str = ""
+    square_colour: str = ""
+    message: str = ""
+
+
+def auto_detect_extrinsic_corners(project, camera_index: int,
+                                  save: bool = True) -> AutoCornersResult:
+    """Detect the extrinsic board for one camera and place the origin.
+
+    Uses every still frame in the camera's extrinsic folder plus up to 40 frames
+    of a calibration video stored there, median-fused. The corners are saved to
+    points.json marked `reviewed: false`; the operator still has to confirm the
+    origin and accept (or fine-tune) them in the GUI.
+    """
+    import cv2
+    from .board_detect import detect_in_frames, iter_video_frames
+    from .origin import canonicalize
+
+    cb = project.config.checkerboard
+    folder = project.extrinsic_cam_dir(camera_index)
+    imgs = sorted(p for p in folder.glob("*") if p.suffix.lower() in (".jpg", ".jpeg", ".png"))
+    vids = sorted(p for p in folder.glob("*") if p.suffix in VIDEO_EXTS)
+
+    first_img = None
+
+    def frames():
+        nonlocal first_img
+        for p in imgs:
+            im = cv2.imread(str(p))
+            if im is not None:
+                if first_img is None:
+                    first_img = im
+                yield im
+        for v in vids:
+            for im in iter_video_frames(v, 40):
+                if first_img is None:
+                    first_img = im
+                yield im
+
+    det = detect_in_frames(frames(), cb.corners_nb, max_frames=len(imgs) + 40 * len(vids))
+    res = AutoCornersResult(camera_index, det.ok, method=det.method,
+                            frames_used=det.frames_used, frames_tried=det.frames_tried,
+                            spread_px=det.spread_px)
+    if not det.ok or first_img is None:
+        res.message = ("board not found automatically - use the 4-corner mode"
+                       if det.frames_tried else "no extrinsic frame or video found")
+        return res
+    guess = canonicalize(first_img, det.points, cb.corners_nb,
+                         origin_square=getattr(cb, "origin_square", ""),
+                         invert_z=getattr(cb, "invert_z", False))
+    res.points = guess.points
+    res.origin_confident = bool(guess.confident)
+    res.origin_reason = guess.reason
+    res.square_colour = guess.square_colour
+    res.message = (f"found in {det.frames_used}/{det.frames_tried} frames ({det.method}); "
+                   f"origin: {guess.reason}" + ("" if guess.confident else " - please confirm"))
+    if save:
+        save_clicked_points(project.extrinsic_points_file(camera_index), guess.points, meta={
+            "source": "auto", "method": str(det.method), "frames_used": int(det.frames_used),
+            "spread_px": round(float(det.spread_px), 3), "origin_confident": bool(guess.confident),
+            "origin_confirmed": False, "reviewed": False,
+        })
+    return res
+
+
+def assess_project_calibration(project, outcome=None):
+    """Red/yellow/green report for the current calibration (see quality.py).
+
+    Re-solves the extrinsics from the saved corners with the intrinsics in
+    Calib.toml (or `outcome`'s fresh intrinsics) so it always matches the files
+    on disk.
+    """
+    from types import SimpleNamespace
+    from ..calib_check import read_calib_for_projection
+    from .quality import assess
+
+    cb = project.config.checkerboard
+    n = project.config.num_cameras
+    if outcome is not None:
+        intr_by_cam = {r.camera_index: r for r in outcome.intrinsics}
+    else:
+        calib = next(iter(sorted(project.calibration_dir.glob("Calib*.toml"))), None)
+        if calib is None:
+            raise FileNotFoundError("no Calib.toml yet - run the calibration first")
+        cams = read_calib_for_projection(calib)
+        intr_by_cam = {i + 1: SimpleNamespace(K=cams[i]["K"], dist=cams[i]["dist"])
+                       for i in range(min(n, len(cams)))}
+    corners_by_cam = {i: load_clicked_points(project.extrinsic_points_file(i))
+                      for i in range(1, n + 1)}
+    square_m = cb.square_size / 1000.0
+    extr, aligned = align_extrinsics(intr_by_cam, corners_by_cam, cb.corners_nb, square_m,
+                                     invert_z=getattr(cb, "invert_z", False))
+    return assess(intr_by_cam, aligned, extr, cb.corners_nb, square_m,
+                  invert_z=getattr(cb, "invert_z", False))

@@ -1,4 +1,4 @@
-"""Camera calibration: intrinsic (auto) + extrinsic (manual clicks) -> Calib.toml."""
+"""Camera calibration: intrinsic (auto) + extrinsic (auto-detected, operator-reviewed) -> Calib.toml."""
 from .intrinsic import calibrate_intrinsic_camera, IntrinsicResult
 from .extrinsic import (
     calibrate_extrinsic_camera,
@@ -11,6 +11,8 @@ from .orchestrator import (
     calibrate_project,
     extract_frames_from_video,
     auto_extract_intrinsic_frames,
+    auto_detect_extrinsic_corners,
+    assess_project_calibration,
 )
 
 __all__ = [
@@ -20,4 +22,5 @@ __all__ = [
     "write_intri_yml", "write_extri_yml", "convert_yml_to_toml",
     "calibrate_project", "extract_frames_from_video",
     "auto_extract_intrinsic_frames",
+    "auto_detect_extrinsic_corners", "assess_project_calibration",
 ]

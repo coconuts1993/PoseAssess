@@ -75,6 +75,29 @@ class _CalibWorker(QObject):
             self.done.emit(False, f"{type(e).__name__}: {e}")
 
 
+class _AutoCornersWorker(QObject):
+    """Detect the extrinsic board on every camera (version 1 pipeline)."""
+    log = Signal(str)
+    done = Signal(list)
+
+    def __init__(self, project):
+        super().__init__()
+        self.project = project
+
+    def run(self):
+        results = []
+        try:
+            from poseassess.core.calibration.orchestrator import auto_detect_extrinsic_corners
+            for i in range(1, self.project.config.num_cameras + 1):
+                self.log.emit(f"[auto] {self.project.cam_name(i)}: detecting…")
+                r = auto_detect_extrinsic_corners(self.project, i, save=True)
+                self.log.emit(f"[auto] {self.project.cam_name(i)}: {r.message}")
+                results.append(r)
+        except Exception as e:  # noqa: BLE001
+            self.log.emit(f"[auto] failed: {type(e).__name__}: {e}")
+        self.done.emit(results)
+
+
 class _ExtractWorker(QObject):
     log = Signal(str)
     done = Signal(int)
@@ -191,9 +214,37 @@ class CalibrationPage(BasePage):
         self.corner_count = QLabel("points: 0 / 0")
         lv.addWidget(self.corner_count)
 
-        auto = QPushButton("Auto-detect corners")
+        auto_all = QPushButton("⚡ Auto-detect ALL cameras")
+        auto_all.setToolTip(
+            "Find the board on every camera (all extrinsic frames / video in each "
+            "camera's folder, median-fused) and place the origin. Then check each "
+            "camera: confirm or set the origin, fine-tune if needed, Save.")
+        auto_all.clicked.connect(self._auto_detect_all)
+        lv.addWidget(auto_all)
+        auto = QPushButton("Auto-detect this camera")
         auto.clicked.connect(self._auto_detect)
         lv.addWidget(auto)
+        orow = QHBoxLayout()
+        ok_origin = QPushButton("✓ Origin OK")
+        ok_origin.setToolTip("The GREEN dot is on the agreed origin corner. "
+                             "Required on every camera before running.")
+        ok_origin.clicked.connect(self._confirm_origin)
+        set_origin = QPushButton("Set origin…")
+        set_origin.setToolTip("Then click the board corner that is the origin; "
+                              "the whole grid is renumbered from it.")
+        set_origin.clicked.connect(lambda: self._start_mode("origin"))
+        orow.addWidget(ok_origin)
+        orow.addWidget(set_origin)
+        lv.addLayout(orow)
+        four = QPushButton("4-corner mode…")
+        four.setToolTip("When auto-detect fails: click the 4 OUTERMOST inner "
+                        "corners (any order); all other corners are filled in "
+                        "and snapped automatically.")
+        four.clicked.connect(lambda: self._start_mode("four"))
+        lv.addWidget(four)
+        self.auto_status = QLabel("")
+        self.auto_status.setWordWrap(True)
+        lv.addWidget(self.auto_status)
         rev = QPushButton("↺ Reverse corner order (180°)")
         rev.setToolTip("Flip the origin to the opposite end. Use so the GREEN "
                        "origin corner is the SAME physical corner on every camera "
@@ -238,8 +289,9 @@ class CalibrationPage(BasePage):
 
         lv.addWidget(QLabel(
             "<small><b>The GREEN dot is the origin (corner 0).</b> It must be the "
-            "SAME physical board corner on every camera. If auto-detect put it at "
-            "the wrong end, click <b>Reverse corner order</b>.<br>"
+            "SAME physical board corner on every camera. Check it, then click "
+            "<b>Origin OK</b> — or <b>Set origin…</b> and click the right corner. "
+            "The first camera you confirm teaches the others.<br>"
             "Left-click: add · drag: move · right-click: remove · wheel: zoom.</small>"))
 
         lv.addStretch(1)
@@ -260,6 +312,10 @@ class CalibrationPage(BasePage):
 
         self.picker = CornerPicker()
         self.picker.points_changed.connect(self._on_points_changed)
+        self.picker.origin_picked.connect(self._on_origin_picked)
+        self.picker.four_clicked.connect(self._on_four_clicked)
+        # per camera: {"source": auto|manual|four|adjusted, "origin_confirmed": bool, ...}
+        self._corner_meta: dict[int, dict] = {}
         root.addWidget(self.picker, 1)
         return w
 
@@ -643,23 +699,173 @@ class CalibrationPage(BasePage):
         self.picker.set_grid_shape(proj.config.checkerboard.corners_nb)
         # if points already saved, show them
         pts_file = proj.extrinsic_points_file(cam)
+        self.auto_status.setText("")
         if pts_file.exists():
             from poseassess.core.calibration import load_clicked_points
+            from poseassess.core.calibration.extrinsic import load_points_meta
             self.picker.set_points([tuple(p) for p in load_clicked_points(pts_file)])
+            meta = load_points_meta(pts_file)
+            if cam not in self._corner_meta:
+                # corners saved before this feature (no meta) were placed by hand
+                # with the origin chosen deliberately: treat them as confirmed.
+                self._corner_meta[cam] = meta or {"source": "manual",
+                                                  "origin_confirmed": True}
+            m = self._corner_meta[cam]
+            if not m.get("origin_confirmed", False):
+                self._set_auto_status("Origin not confirmed yet — check the GREEN dot, "
+                                      "then Origin OK / Set origin.", "warn")
         self._on_points_changed(len(self.picker.points()))
 
+    def _cur_corner_cam(self) -> int:
+        return self.corner_cam.currentIndex() + 1
+
+    def _set_auto_status(self, text: str, level: str = "info"):
+        colour = {"ok": "#2e8b57", "warn": "#b8860b", "bad": "#c0392b"}.get(level, "")
+        self.auto_status.setText(f"<small><span style='color:{colour}'>{text}</span></small>"
+                                 if colour else f"<small>{text}</small>")
+
     def _auto_detect(self):
+        """Version 1 detector on this camera (all its frames + video), with the
+        origin placed from the board colour + handedness."""
         proj = self.state.project
         if not proj:
             return
-        ok = self.picker.auto_detect(proj.config.checkerboard.corners_nb)
-        if ok:
-            self.picker.set_grid_shape(proj.config.checkerboard.corners_nb)
-        else:
+        from poseassess.core.calibration.orchestrator import auto_detect_extrinsic_corners
+        cam = self._cur_corner_cam()
+        r = auto_detect_extrinsic_corners(proj, cam, save=False)
+        if not r.ok:
+            self._set_auto_status(r.message, "bad")
             QMessageBox.information(
                 self, "Auto-detect",
-                "Board not auto-detected on this frame. Click the corners "
-                "manually (a different reference frame may detect better).")
+                "Board not found automatically on this camera.\n\n"
+                "Use 4-corner mode: click the 4 outermost inner corners and the "
+                "rest is filled in.")
+            return
+        self.picker.set_points([tuple(p) for p in r.points])
+        self.picker.set_grid_shape(proj.config.checkerboard.corners_nb)
+        self._corner_meta[cam] = {"source": "auto", "method": r.method,
+                                  "frames_used": r.frames_used,
+                                  "origin_confirmed": False}
+        self._set_auto_status(
+            r.message + ("" if r.origin_confident else
+                         "<br><b>Check the GREEN origin, then Origin OK / Set origin.</b>"),
+            "ok" if r.origin_confident else "warn")
+
+    def _auto_detect_all(self):
+        proj = self.state.project
+        if not proj:
+            return
+        self.calib_log.appendPlainText("=== auto-detecting corners on all cameras ===")
+        self._auto_worker = _AutoCornersWorker(proj)
+        self._auto_worker.log.connect(self.calib_log.appendPlainText)
+        self._auto_worker.done.connect(self._auto_all_done)
+        self._auto_thread = QThread()
+        self._auto_worker.moveToThread(self._auto_thread)
+        self._auto_thread.started.connect(self._auto_worker.run)
+        self._auto_worker.done.connect(self._auto_thread.quit)
+        self._auto_thread.finished.connect(self._auto_thread.deleteLater)
+        self._auto_thread.start()
+
+    def _auto_all_done(self, results):
+        proj = self.state.project
+        found = [r for r in results if r.ok]
+        missing = [proj.cam_name(r.camera_index) for r in results if not r.ok]
+        for r in found:
+            self._corner_meta[r.camera_index] = {"source": "auto", "method": r.method,
+                                                 "frames_used": r.frames_used,
+                                                 "origin_confirmed": False}
+        self._load_corner_image()
+        msg = f"Board found on {len(found)}/{len(results)} cameras."
+        if missing:
+            msg += "\nNot found: " + ", ".join(missing) + " — use 4-corner mode there."
+        msg += ("\n\nNow go through the cameras: check the GREEN origin, click "
+                "Origin OK (or Set origin…), fine-tune if needed, and Save.")
+        QMessageBox.information(self, "Auto-detect", msg)
+
+    def _start_mode(self, mode: str):
+        if mode == "origin" and len(self.picker.points()) != self._expected_corners():
+            QMessageBox.information(self, "Set origin",
+                                    "Detect or mark the full grid first.")
+            return
+        self.picker.start_click_mode(mode)
+        self._set_auto_status(
+            "Click the ORIGIN corner of the board…" if mode == "origin"
+            else "Click the 4 outermost inner corners (any order)… right-click cancels",
+            "warn")
+
+    def _learn_origin_colour(self, pts):
+        """Remember the colour of the origin square so the next cameras place
+        the origin by themselves."""
+        proj = self.state.project
+        gray = self.picker.gray_image()
+        if not proj or gray is None:
+            return
+        import numpy as np
+        from poseassess.core.calibration.origin import corner_square_colour
+        colour, contrast = corner_square_colour(gray, np.asarray(pts, float),
+                                                proj.config.checkerboard.corners_nb)
+        cb = proj.config.checkerboard
+        if colour and contrast >= 0.08 and cb.origin_square != colour:
+            cb.origin_square = colour
+            try:
+                proj.save()
+            except Exception as e:  # noqa: BLE001
+                self.calib_log.appendPlainText(f"could not save project: {e}")
+            self.calib_log.appendPlainText(
+                f"origin square learned: {colour} (used for the other cameras)")
+
+    def _mark_origin_confirmed(self):
+        cam = self._cur_corner_cam()
+        meta = self._corner_meta.setdefault(cam, {"source": "manual"})
+        meta["origin_confirmed"] = True
+        self._learn_origin_colour(self.picker.points())
+        self._set_auto_status("Origin confirmed. Fine-tune any corner if needed, "
+                              "then Save corners for this cam.", "ok")
+
+    def _confirm_origin(self):
+        if len(self.picker.points()) != self._expected_corners():
+            QMessageBox.information(self, "Origin", "Detect or mark the full grid first.")
+            return
+        self._mark_origin_confirmed()
+
+    def _on_origin_picked(self, x, y):
+        proj = self.state.project
+        if not proj:
+            return
+        import numpy as np
+        from poseassess.core.calibration.origin import reorder_to_corner, z_up
+        nb = proj.config.checkerboard.corners_nb
+        pts, _ = reorder_to_corner(np.asarray(self.picker.points(), float), nb, (x, y))
+        self.picker.set_points([tuple(p) for p in pts])
+        self.picker.set_grid_shape(nb)
+        self._mark_origin_confirmed()
+        if not z_up(pts, nb, getattr(proj.config.checkerboard, "invert_z", False)):
+            self.calib_log.appendPlainText(
+                f"{proj.cam_name(self._cur_corner_cam())}: with this origin the world Z "
+                "axis points DOWN for this view. That is fine if it is your agreed "
+                "corner — then turn on 'Flip Z axis'.")
+
+    def _on_four_clicked(self, clicks):
+        proj = self.state.project
+        gray = self.picker.gray_image()
+        if not proj or gray is None:
+            return
+        from poseassess.core.calibration.board_detect import corners_from_outer4
+        from poseassess.core.calibration.origin import canonicalize
+        cb = proj.config.checkerboard
+        try:
+            pts = corners_from_outer4(gray, cb.corners_nb, clicks)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.warning(self, "4-corner mode", f"Could not build the grid: {e}")
+            return
+        g = canonicalize(gray, pts, cb.corners_nb, origin_square=cb.origin_square,
+                         invert_z=getattr(cb, "invert_z", False))
+        self.picker.set_points([tuple(p) for p in g.points])
+        self.picker.set_grid_shape(cb.corners_nb)
+        self._corner_meta[self._cur_corner_cam()] = {"source": "four",
+                                                     "origin_confirmed": False}
+        self._set_auto_status("Grid filled from 4 clicks. Check the corners and the "
+                              "GREEN origin, then Origin OK / Set origin.", "warn")
 
     def _rotate_corners(self, clockwise: bool):
         proj = self.state.project
@@ -689,8 +895,27 @@ class CalibrationPage(BasePage):
                 f"Have {len(pts)} points but board needs {expected}. "
                 f"Add/remove points to match before saving.")
             return
-        save_clicked_points(proj.extrinsic_points_file(cam), pts)
-        self.calib_log.appendPlainText(f"saved {len(pts)} corners for {proj.cam_name(cam)}")
+        meta = dict(self._corner_meta.get(cam, {"source": "manual"}))
+        if self.picker.user_edited and meta.get("source") in ("auto", "four"):
+            meta["source"] = "adjusted"
+        if not meta.get("origin_confirmed", False):
+            ans = QMessageBox.question(
+                self, "Save corners",
+                "The origin of this camera has not been confirmed.\n\n"
+                "Is the GREEN dot on the agreed origin corner?",
+                QMessageBox.Yes | QMessageBox.No)
+            if ans != QMessageBox.Yes:
+                return
+            self._mark_origin_confirmed()
+            meta["origin_confirmed"] = True
+        import datetime
+        meta["reviewed"] = True
+        meta["saved_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+        self._corner_meta[cam] = meta
+        save_clicked_points(proj.extrinsic_points_file(cam), pts, meta=meta)
+        self.picker.user_edited = False
+        self.calib_log.appendPlainText(
+            f"saved {len(pts)} corners for {proj.cam_name(cam)} ({meta.get('source')})")
 
     def _import_calibration(self):
         proj = self.state.project
@@ -749,6 +974,19 @@ class CalibrationPage(BasePage):
         proj = self.state.project
         if not proj:
             return
+        from poseassess.core.calibration.extrinsic import load_points_meta
+        unconfirmed = []
+        for i in range(1, proj.config.num_cameras + 1):
+            f = proj.extrinsic_points_file(i)
+            meta = load_points_meta(f) if f.exists() else {}
+            if meta and not meta.get("origin_confirmed", False):
+                unconfirmed.append(proj.cam_name(i))
+        if unconfirmed:
+            QMessageBox.warning(
+                self, "Run calibration",
+                "Confirm the origin on these cameras first (check the GREEN dot, "
+                "Origin OK, Save):\n" + ", ".join(unconfirmed))
+            return
         self.calib_log.appendPlainText("=== running calibration ===")
         self._worker = _CalibWorker(proj)
         self._worker.log.connect(self.calib_log.appendPlainText)
@@ -766,6 +1004,28 @@ class CalibrationPage(BasePage):
             # the calibration/ folder just changed on disk — refresh Verify from
             # it so the cube/verdict reflect the new Calib.toml immediately.
             self._verify_run()
-            QMessageBox.information(self, "Calibration", msg)
+            report = None
+            try:
+                from poseassess.core.calibration.orchestrator import assess_project_calibration
+                report = assess_project_calibration(self.state.project)
+                self.calib_log.appendPlainText("--- review ---")
+                for ln in report.summary_lines():
+                    self.calib_log.appendPlainText(ln)
+            except Exception as e:  # noqa: BLE001
+                self.calib_log.appendPlainText(f"review: {type(e).__name__}: {e}")
+            if report is None:
+                QMessageBox.information(self, "Calibration", msg)
+            elif report.level == "green":
+                QMessageBox.information(
+                    self, "Calibration — all GREEN",
+                    msg + "\n\n" + "\n".join(report.summary_lines()) +
+                    "\n\nAll cameras pass. Check the cubes in Verify and you're done.")
+            else:
+                bad = [f"cam{c.camera_index:02d}" for c in report.cameras if c.level != "green"]
+                QMessageBox.warning(
+                    self, f"Calibration — {report.level.upper()}",
+                    msg + "\n\n" + "\n".join(report.summary_lines()) +
+                    "\n\nFine-tune the corners of: " + (", ".join(bad) or "(see board metrics)") +
+                    "\nthen Save and Run again.")
         else:
             QMessageBox.critical(self, "Calibration failed", msg)
