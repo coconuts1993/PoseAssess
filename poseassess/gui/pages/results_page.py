@@ -5,6 +5,11 @@ table (asymmetries flagged), plots each joint's R/L angle curve, and exports the
 report to CSV/JSON. This is the clinical layer that the underlying engines
 (Pose2Sim/OpenSim) don't provide.
 
+"Export all angles (CSV)…" writes every coordinate (angles wrapped to −180..180° by default,
+the "Angles in −180..180°" box) and, when the .trc the .mot was computed from is found, the
+throwing angles of ``core.assessment.throwing`` (``<base>_throwing.csv``); "Throwing angles from
+.trc…" writes them for any .trc, without a project or a .mot.
+
 The joint angles are in the "Joint angles" tab (unchanged). The "Balance (Wii)" tab holds the
 Wii Balance Board analysis (``BalancePanel``: recording + alignment, COP / COM sway metrics,
 force plots, fused-table export).
@@ -18,7 +23,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QComboBox, QFileDialog, QHBoxLayout, QHeaderView, QLabel, QMessageBox,
+    QCheckBox, QComboBox, QFileDialog, QHBoxLayout, QHeaderView, QLabel, QMessageBox,
     QPushButton, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
@@ -60,6 +65,30 @@ class ResultsPage(BasePage):
         bar.addWidget(self.export_btn)
         bar.addWidget(self.export_csv_btn)
         root.addLayout(bar)
+        self._top_bar = bar
+
+        # ---- export options: a second row, right-aligned under the export buttons (it is
+        # narrower than the row above, so the page's minimum width does not grow) ----
+        opts = QHBoxLayout()
+        self.wrap_check = QCheckBox("Angles in −180..180°")
+        self.wrap_check.setChecked(True)
+        self.wrap_check.setToolTip(
+            "For “Export all angles (CSV)…”. OpenSim angles have no ±180° limit, so the inverse "
+            "kinematics can drift by whole turns (e.g. 400° = 40°).\nChecked: every angle in "
+            "degrees is wrapped to −180..180°, which removes whole turns. An angle that really "
+            "passes ±180° then jumps by 360°.\nTranslations (m) are not changed.")
+        self.throwing_btn = QPushButton("Throwing angles from .trc…")
+        self.throwing_btn.setToolTip(
+            "Shoulder external rotation, shoulder abduction and elbow flexion (R/L, degrees) "
+            "computed directly from the 3D keypoints of a .trc, without OpenSim (no gimbal lock "
+            "at 90° abduction, no whole turns).\nWorks with any saved .trc, also without a "
+            "project. Writes a CSV (empty cell = undefined, e.g. straight elbow).")
+        self.throwing_btn.clicked.connect(self._export_throwing)
+        opts.addStretch(1)
+        opts.addWidget(self.wrap_check)
+        opts.addWidget(self.throwing_btn)
+        root.addLayout(opts)
+        self._export_opts = opts
 
         # ---- tabs: joint angles (split: table | plot) | balance (Wii) ----
         self.tabs = QTabWidget()
@@ -226,16 +255,81 @@ class ResultsPage(BasePage):
         out_dir = base_path.parent
         out_stem = base_path.stem
         from poseassess.core.assessment import export_all
+        wrap = self.wrap_check.isChecked()
         try:
-            out = export_all(self._motion, out_dir, out_stem)
+            out = export_all(self._motion, out_dir, out_stem, wrap_degrees=wrap)
         except Exception as e:  # noqa: BLE001
             QMessageBox.critical(self, "Export failed", str(e))
             return
         n = len(self._motion.df.columns)
+        lines = [f"Wrote {n} coordinates"
+                 + (" (angles in −180..180°)" if wrap else "") + ":",
+                 f"• {out['angles'].name} (time series)",
+                 f"• {out['summary'].name} (per-coordinate summary)"]
+        trc = self._matching_trc()
+        if trc is not None:
+            from poseassess.core.assessment import export_throwing_csv
+            try:
+                p = export_throwing_csv(trc, out_dir / f"{out_stem}_throwing.csv")
+                lines.append(f"• {p.name} (throwing angles from {trc.name})")
+            except Exception as e:  # noqa: BLE001  (the joint angles are written all the same)
+                lines.append(f"Throwing angles not written ({trc.name}): {e}")
+        QMessageBox.information(self, "Export all angles", "\n".join(lines))
+
+    def _matching_trc(self) -> Path | None:
+        """The .trc the loaded .mot was computed from, or None. Pose2Sim names the .mot after the
+        .trc (pose-3d/<stem>.trc -> kinematics/<stem>.mot); also looked for next to the .mot."""
+        mot = getattr(self, "_mot_path", None)
+        if mot is None:
+            return None
+        mot = Path(mot)
+        proj = self.state.project
+        folders = ([proj.pose3d_dir] if proj else []) + [mot.parent]
+        for d in folders:
+            p = d / f"{mot.stem}.trc"
+            if p.is_file():
+                return p
+        return None
+
+    def _export_throwing(self):
+        """"Throwing angles from .trc…": any .trc (start in the project's pose-3d folder) ->
+        a CSV of ``throwing_angles``; works without a project."""
+        proj = self.state.project
+        start = str(proj.pose3d_dir) if proj and proj.pose3d_dir.is_dir() else ""
+        f, _ = QFileDialog.getOpenFileName(self, "Throwing angles: choose a .trc file", start,
+                                           "3D keypoints (*.trc)")
+        if not f:
+            return
+        trc_path = Path(f)
+        out_start = str((proj.root if proj else trc_path.parent)
+                        / f"{trc_path.stem}_throwing.csv")
+        out, _ = QFileDialog.getSaveFileName(self, "Save throwing angles (CSV)", out_start,
+                                             "CSV (*.csv)")
+        if not out:
+            return
+        out_path = Path(out)
+        if out_path.suffix.lower() != ".csv":
+            out_path = out_path.with_name(out_path.name + ".csv")
+        from poseassess.core.assessment import throwing_angles, write_throwing_csv
+        try:
+            angles = throwing_angles(trc_path)
+            write_throwing_csv(angles, out_path)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, "Throwing angles failed", str(e))
+            return
         QMessageBox.information(
-            self, "Export all angles",
-            f"Wrote {n} coordinates:\n• {out['angles'].name} (time series)\n"
-            f"• {out['summary'].name} (per-coordinate summary)")
+            self, "Throwing angles",
+            f"Wrote {out_path.name} ({len(angles)} frames from {trc_path.name}):\n"
+            f"shoulder external rotation, shoulder abduction, elbow flexion (R/L, deg).\n"
+            f"Max. shoulder external rotation: R {self._max_text(angles['shoulder_er_r'])}, "
+            f"L {self._max_text(angles['shoulder_er_l'])}.\n"
+            f"Empty cells: undefined (missing keypoints, or an elbow too straight for the "
+            f"shoulder rotation).")
+
+    @staticmethod
+    def _max_text(series) -> str:
+        """Largest value of a pandas series (NaN skipped) as text, "—" when all NaN."""
+        return f"{series.max():.1f}°" if series.notna().any() else "—"
 
     def _export_csv(self, path: Path):
         with open(path, "w", newline="") as f:

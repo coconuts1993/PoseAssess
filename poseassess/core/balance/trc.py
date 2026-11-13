@@ -1,9 +1,8 @@
 """Robust .trc reader for the Wii fusion + frame conversions.
 
-``poseassess.core.trc_io.read_trc`` (used by the existing 3D View) drops empty fields, so a row
-with a missing (NaN) marker shifts columns, and it drops Frame#. It is left unchanged; the
-balance code uses ``read_trc_full`` (port of PoseBoard 3ea6d8a ``pose/external.read_trc`` + the
-Frame# column).
+``poseassess.core.trc_io.read_trc`` (used by the existing 3D View) keeps empty fields too, but
+it drops Frame#, all-NaN markers and the Units scaling; the balance code uses ``read_trc_full``
+(port of PoseBoard 3ea6d8a ``pose/external.read_trc`` + the Frame# column).
 
 Frames
 ------

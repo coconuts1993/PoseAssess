@@ -11,6 +11,7 @@ and fusion numerically:
 * ``standing_trial``: a HALPE_26 person standing on the board (swaying; optional jump + stomp),
   in the world frame, plus the matching Wii force (COP, total load) on the same time base.
 * ``write_trc``: Pose2Sim-format .trc (Y-up, Frame# 0-based, Time = Frame#/rate, NaN = empty).
+* ``throwing_pose``: shoulders / hips / elbows / wrists with known throwing angles.
 * ``write_wii_recording``: a recording folder in the ``poseassess.wii.io`` format.
 * ``make_demo_trial``: a complete PoseAssess project (Calib.toml, board clicks + board.json,
   .trc, Wii recording, trial.json) - used by tests and the screenshot scripts.
@@ -296,6 +297,35 @@ def write_trc(path, names: list[str], coords_trc: np.ndarray, rate: float,
         lines.append(f"{f}\t{f / rate:.6f}\t" + "\t".join(vals))
     path.write_text("\n".join(lines) + "\n")
     return path
+
+
+# Throwing pose (``core.assessment.throwing``): body frame x right, y front, z up, metres.
+THROWING_TRUNK = {"RShoulder": (0.20, 0.0, 1.50), "LShoulder": (-0.20, 0.0, 1.50),
+                  "RHip": (0.12, 0.0, 1.00), "LHip": (-0.12, 0.0, 1.00)}
+UPPER_ARM_M, FOREARM_M = 0.30, 0.25
+
+
+def _throwing_arm(side: str, er_deg: float, abd_deg: float, flex_deg: float):
+    lat = np.array([1.0 if side == "r" else -1.0, 0.0, 0.0])
+    up, fwd = np.array([0.0, 0.0, 1.0]), np.array([0.0, 1.0, 0.0])
+    a = np.radians(abd_deg)
+    u = np.sin(a) * lat - np.cos(a) * up                  # upper arm, in the frontal plane
+    e2 = (1.0 if side == "r" else -1.0) * np.cross(u, fwd)
+    t, fl = np.radians(er_deg), np.radians(flex_deg)
+    f = np.cos(fl) * u + np.sin(fl) * (np.cos(t) * fwd + np.sin(t) * e2)
+    elbow = np.array(THROWING_TRUNK["RShoulder" if side == "r" else "LShoulder"]) + UPPER_ARM_M * u
+    return elbow, elbow + FOREARM_M * f
+
+
+def throwing_pose(er_r: float = 0.0, er_l: float = 0.0, abd_deg: float = 90.0,
+                  flex_deg: float = 90.0) -> dict[str, np.ndarray]:
+    """Shoulders, hips, elbows and wrists of a subject facing +y: both upper arms abducted
+    ``abd_deg`` in the frontal plane, elbows flexed ``flex_deg``, forearms at ``er_r`` / ``er_l``
+    external rotation (0 = forward, 90 = up with the arm horizontal; ``throwing`` definitions)."""
+    d = {k: np.array(v, float) for k, v in THROWING_TRUNK.items()}
+    d["RElbow"], d["RWrist"] = _throwing_arm("r", er_r, abd_deg, flex_deg)
+    d["LElbow"], d["LWrist"] = _throwing_arm("l", er_l, abd_deg, flex_deg)
+    return d
 
 
 def write_wii_recording(folder, t_rel, kg, events=(), t0=1000.0, clock_offset_unix=1.7e9,

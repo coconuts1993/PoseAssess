@@ -48,13 +48,47 @@ applies to the 3D trajectories before inverse kinematics. 6 Hz is Pose2Sim's
 default and suits walking and slow movements (3-6 Hz); running needs about
 6-15 Hz, throwing and other very fast movements 12-20 Hz (6 Hz removes real
 motion of a pitch). Whole Hz only, and always below half the frame rate (at
-60 fps at most 29 Hz). Use the same value for all trials you compare. The
+60 fps at most 29 Hz; at 1-2 fps no low-pass filter is possible and
+none is applied). Use the same value for all trials you compare. The
 value is kept in project.toml and written into Config.toml on Save settings
 (edit it here, not in Config.toml: Config.toml is regenerated). A new value
 applies from the filtering stage on: Save settings, then on 4. Run re-run
 from "Filter 3D" (tick "Filter 3D" and the stages after it; the 2D and
 triangulated 3D results are reused). The Run log shows the value used, e.g.
 "[filtering] Butterworth low-pass 13 Hz (Config.toml)".
+
+JOINT ANGLES: -180..180 DEG AND THROWING ANGLES (6. RESULTS)
+------------------------------------------------------------
+* "Export all angles (CSV)..." with "Angles in -180..180 deg" checked (the
+  default): every OpenSim angle in degrees is wrapped to -180..180. OpenSim
+  angles have no +-180 limit, so the inverse kinematics can drift by whole
+  turns (an arm_rot_r of 400 deg is 40 deg, -200 deg is 160 deg). Wrapping
+  removes whole turns only: an angle that really passes +-180 then jumps by
+  360. Translations (pelvis_tx/ty/tz, metres) are not changed; the summary
+  CSV uses the same wrapped values. Uncheck it for the values exactly as
+  OpenSim wrote them.
+* Throwing angles from the 3D keypoints (.trc), independent of OpenSim:
+  shoulder_er_r/l (external rotation), shoulder_abduction_r/l and
+  elbow_flexion_r/l, in degrees. OpenSim's shoulder (arm_flex, arm_add,
+  arm_rot) locks near 90 deg abduction, the arm position of a pitch, so
+  arm_flex and arm_rot swap there; these angles do not have that problem.
+  - "Export all angles (CSV)..." also writes <base>_throwing.csv when the
+    .trc of the loaded .mot is found (pose-3d\<name of the .mot>.trc, or
+    next to the .mot).
+  - "Throwing angles from .trc..." writes them for any .trc you choose
+    (also a saved .trc without a project).
+  - shoulder_er: 0 = forearm pointing forward, 90 = forearm up (arm
+    abducted 90 deg), about 180 = forearm pointing backward (maximum
+    layback); relative to the trunk (shoulders and hips). It needs a flexed
+    elbow: an empty cell means undefined (elbow flexion below 20 deg, upper
+    arm pointing straight forward / backward, or a missing keypoint).
+    Abduction: 0 = arm down, 90 = horizontal, 180 = overhead. Elbow
+    flexion: 0 = straight arm.
+  - The keypoints are joint centres from the 2D pose models, not anatomical
+    markers: expect several degrees of error. The fast internal rotation
+    after maximum layback needs a high frame rate (about 120 fps or more).
+  - Keep the .trc files: the throwing angles can be computed again from them
+    at any time.
 
 WII BALANCE BOARD (OPTIONAL)
 ----------------------------
