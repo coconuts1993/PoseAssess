@@ -33,6 +33,14 @@ from ..widgets.plot_canvas import PlotCanvas
 from .base_page import BasePage
 
 
+
+def _is_inside(path: Path, folder: Path) -> bool:
+    """``path`` lies inside ``folder`` (both resolved; False when they cannot be)."""
+    try:
+        return Path(path).resolve().is_relative_to(Path(folder).resolve())
+    except (OSError, ValueError, RuntimeError):
+        return False
+
 class ResultsPage(BasePage):
     nav_title = "6. Results"
 
@@ -262,8 +270,11 @@ class ResultsPage(BasePage):
             QMessageBox.critical(self, "Export failed", str(e))
             return
         n = len(self._motion.df.columns)
+        from poseassess.core.assessment.export import coordinate_unit
+        wrapped = wrap and any(coordinate_unit(self._motion, c) == "deg"
+                               for c in self._motion.df.columns)
         lines = [f"Wrote {n} coordinates"
-                 + (" (angles in −180..180°)" if wrap else "") + ":",
+                 + (" (angles in −180..180°)" if wrapped else "") + ":",
                  f"• {out['angles'].name} (time series)",
                  f"• {out['summary'].name} (per-coordinate summary)"]
         trc = self._matching_trc()
@@ -284,7 +295,12 @@ class ResultsPage(BasePage):
             return None
         mot = Path(mot)
         proj = self.state.project
-        folders = ([proj.pose3d_dir] if proj else []) + [mot.parent]
+        # the .mot's own project (<project>/kinematics/x.mot -> <project>/pose-3d/x.trc) and
+        # its own folder; the open project's pose-3d only for a .mot inside that project (a
+        # .mot browsed from another project with the same file name must not get this one's)
+        folders = [mot.parent.parent / "pose-3d", mot.parent]
+        if proj is not None and _is_inside(mot, proj.root):
+            folders.append(proj.pose3d_dir)
         for d in folders:
             p = d / f"{mot.stem}.trc"
             if p.is_file():

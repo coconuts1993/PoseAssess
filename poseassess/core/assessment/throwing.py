@@ -46,7 +46,8 @@ Continuity: ``shoulder_er`` is unwrapped over time (``np.unwrap``, period 360) o
 samples, ACROSS NaN gaps: after a gap the value closest (modulo 360) to the last valid one is
 kept, so 170 -> 190 stays 190 (not -170) even when a few frames with a straight elbow lie in
 between. The whole series is then shifted by a multiple of 360 so that its median lies in
-[-180, 180). This assumes less than 180 deg of rotation between two consecutive valid samples:
+[-135, 225): external rotation in a pitch reaches about 180 deg and more (layback), internal
+rotation stays above about -90 deg. This assumes less than 180 deg of rotation between two consecutive valid samples:
 the arm's internal rotation after maximum layback can exceed 5000 deg/s, so the acceleration
 phase needs a high frame rate (about 120 Hz or more) to be followed.
 
@@ -76,6 +77,10 @@ THROWING_COLUMNS = ("shoulder_er_r", "shoulder_er_l",
                     "elbow_flexion_r", "elbow_flexion_l")
 MIN_ELBOW_FLEXION_DEG = 20.0   # below: shoulder_er undefined (forearm in line with the upper arm)
 MIN_FORWARD_PERP = 0.2         # |forward - (forward.u) u| below: shoulder_er undefined
+#: shoulder_er is shifted by whole turns so its median lies in [MEDIAN_LOW_DEG, +360): external
+#: rotation in a pitch reaches about 180 deg (layback) and more, internal rotation stays above
+#: about -90 deg, so a trial (or cut-out) centred on the layback keeps positive values.
+MEDIAN_LOW_DEG = -135.0
 _EPS = 1e-12
 
 
@@ -132,13 +137,13 @@ def trunk_axes(rshoulder: np.ndarray, lshoulder: np.ndarray, rhip: np.ndarray,
 def continuous_degrees(values: np.ndarray) -> np.ndarray:
     """``values`` (deg) made continuous over time: ``np.unwrap`` (period 360) over the finite
     samples, across NaN gaps, then shifted by a multiple of 360 so the median is in
-    [-180, 180). NaN stays NaN."""
+    [-135, 225) (``MEDIAN_LOW_DEG``). NaN stays NaN."""
     out = np.array(values, dtype=float)
     ok = np.isfinite(out)
     if not ok.any():
         return out
     v = np.unwrap(out[ok], period=360.0)
-    v -= 360.0 * np.floor((np.median(v) + 180.0) / 360.0)
+    v -= 360.0 * np.floor((np.median(v) - MEDIAN_LOW_DEG) / 360.0)
     out[ok] = v
     return out
 

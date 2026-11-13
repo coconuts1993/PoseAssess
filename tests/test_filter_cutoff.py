@@ -390,3 +390,15 @@ def test_window_min_width_unchanged_by_the_row(qapp):
     finally:
         w.close()
         w.deleteLater()
+
+
+@pytest.mark.parametrize("frame_rate, filtered", [(1, False), (2, False), (3, True), (60, True)])
+def test_no_low_pass_where_no_whole_hz_is_below_nyquist(project, pose2sim, frame_rate, filtered):
+    """At 1-2 fps every whole-Hz cut-off reaches Nyquist (scipy would fail): filter = false,
+    so Pose2Sim's filtering stage only copies the data instead of stopping with an error."""
+    from poseassess.core.config_gen import generate_config
+
+    project.config.frame_rate = frame_rate
+    filt = read_toml(generate_config(project))["filtering"]
+    assert filt.get("filter", True) is filtered
+    assert filt["butterworth"]["cut_off_frequency"] >= 1

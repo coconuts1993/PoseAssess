@@ -49,7 +49,8 @@ def pose2sim_template_path() -> Path:
 
 def max_filter_cutoff(frame_rate: int) -> int:
     """Highest whole-Hz low-pass cut-off below the Nyquist frequency ``frame_rate / 2``
-    (e.g. 29 at 60 fps, 30 at 61 fps); at least 1."""
+    (e.g. 29 at 60 fps, 30 at 61 fps); at least 1, which is not below Nyquist at 1-2 fps:
+    there ``generate_config`` turns the low-pass filter off."""
     return max(1, math.ceil(frame_rate / 2) - 1)
 
 
@@ -126,8 +127,12 @@ def generate_config(project, out_file: Path | None = None) -> Path:
     # Zero-lag Butterworth low-pass (the template's filter and order) with the project's
     # cut-off: 6 Hz (Pose2Sim's default) removes real motion of fast movements (throwing).
     filt["type"] = "butterworth"
-    filt.setdefault("butterworth", {})["cut_off_frequency"] = effective_filter_cutoff(
+    cutoff = effective_filter_cutoff(
         getattr(cfg, "filter_cutoff_hz", DEFAULT_FILTER_CUTOFF_HZ), cfg.frame_rate)
+    filt.setdefault("butterworth", {})["cut_off_frequency"] = cutoff
+    if cutoff >= cfg.frame_rate / 2:
+        # 1-2 fps: no whole-Hz cut-off lies below the Nyquist frequency (scipy would fail)
+        filt["filter"] = False
 
     # ---- [calibration] ----
     # We calibrate ourselves and hand Pose2Sim a ready Calib.toml, so default to

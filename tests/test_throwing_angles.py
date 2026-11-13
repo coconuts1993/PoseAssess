@@ -228,3 +228,11 @@ def test_export_csv_layout(tmp_path):
     r1 = dict(zip(rows[0], rows[3]))
     assert r1["time"] == "0.01000" and r1["shoulder_er_r"] == ""      # straight elbow: blank
     assert r1["elbow_flexion_r"] == "5.00000"
+
+
+def test_median_window_keeps_a_layback_centred_series_positive():
+    """A cut-out around maximum layback (median about 190 deg) stays positive."""
+    v = continuous_degrees([170.0, 185.0, 190.0, 200.0, 205.0])
+    np.testing.assert_allclose(v, [170.0, 185.0, 190.0, 200.0, 205.0])
+    np.testing.assert_allclose(continuous_degrees([-150.0, -160.0]), [210.0, 200.0])
+    np.testing.assert_allclose(continuous_degrees([-100.0, -80.0]), [-100.0, -80.0])

@@ -225,3 +225,44 @@ def test_throwing_button_starts_in_pose3d_and_reports_errors(qapp, project, tmp_
     dialogs["open"], dialogs["save"] = str(trc), ""
     page.throwing_btn.click()
     assert len(boxes) == n
+
+
+# ------------------------------------------------------------------ review fixes
+def test_matching_trc_prefers_the_mots_own_project(qapp, tmp_path):
+    """Two projects with the same folder name and frame range give the same file names: a
+    .mot browsed from project B must get B's .trc, never the open project A's."""
+    from poseassess.core.project import Project
+
+    a = Project(tmp_path / "SubjectA" / "trial1").create()
+    b = Project(tmp_path / "SubjectB" / "trial1").create()
+    stem = "trial1_0-299_filt_butterworth"
+    trc_a = _write_trc(a.pose3d_dir / f"{stem}.trc")
+    trc_b = _write_trc(b.pose3d_dir / f"{stem}.trc")
+    mot_b = _write_mot(b.kinematics_dir / f"{stem}.mot")
+
+    page = _page(a)                                  # project A open, B's .mot loaded
+    page._load(mot_b)
+    assert page._matching_trc() == trc_b
+    page2 = _page()                                  # no project open: still found
+    page2._load(mot_b)
+    assert page2._matching_trc() == trc_b
+    mot_a = _write_mot(a.kinematics_dir / f"{stem}.mot")
+    page._load(mot_a)
+    assert page._matching_trc() == trc_a
+    trc_b.unlink()                                   # B has none: A's is not taken for B
+    page._load(mot_b)
+    assert page._matching_trc() is None
+
+
+def test_export_message_mentions_wrapping_only_for_degree_files(qapp, project, tmp_path, boxes,
+                                                                dialogs):
+    mot = _write_mot(project.kinematics_dir / "rad.mot")
+    mot.write_text(mot.read_text().replace("inDegrees=yes", "inDegrees=no"))
+    page = _page(project)
+    page._load(mot)
+    assert page.wrap_check.isChecked()
+    dialogs["save"] = str(tmp_path / "out" / "rad.csv")
+    page.export_csv_btn.click()
+    assert boxes[-1][0] == "information" and "−180..180°" not in boxes[-1][2]
+    cols, units = _csv(tmp_path / "out" / "rad_angles.csv")
+    assert set(cols["arm_rot_r"]) == {"400.00000"}  # radians: not wrapped
