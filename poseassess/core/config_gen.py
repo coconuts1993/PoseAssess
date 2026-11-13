@@ -7,6 +7,7 @@ keep their sensible defaults, we just steer the ones that matter.
 """
 from __future__ import annotations
 
+import math
 import shutil
 import sys
 from pathlib import Path
@@ -19,6 +20,7 @@ else:  # pragma: no cover
 import tomli_w
 
 from .pose_backends import get_backend
+from .project import DEFAULT_FILTER_CUTOFF_HZ
 
 
 # Map our friendly backend + skeleton choices to Pose2Sim's pose_model values.
@@ -43,6 +45,30 @@ def pose2sim_template_path() -> Path:
     if not cand.exists():
         raise FileNotFoundError(f"Pose2Sim template not found at {cand}")
     return cand
+
+
+def max_filter_cutoff(frame_rate: int) -> int:
+    """Highest whole-Hz low-pass cut-off below the Nyquist frequency ``frame_rate / 2``
+    (e.g. 29 at 60 fps, 30 at 61 fps); at least 1."""
+    return max(1, math.ceil(frame_rate / 2) - 1)
+
+
+def parse_filter_cutoff(value) -> int:
+    """A cut-off setting (e.g. typed into project.toml) in whole Hz, at least 1: truncated
+    like Pose2Sim reads it (``int()``); not a number: Pose2Sim's default 6."""
+    try:
+        hz = int(float(value))
+    except (TypeError, ValueError, OverflowError):
+        hz = DEFAULT_FILTER_CUTOFF_HZ
+    return max(hz, 1)
+
+
+def effective_filter_cutoff(cutoff, frame_rate: int) -> int:
+    """The Butterworth cut-off (Hz) written to Config.toml for the setting ``cutoff``:
+    ``parse_filter_cutoff(cutoff)`` clamped to ``max_filter_cutoff(frame_rate)``. scipy's
+    ``signal.butter`` fails for a cut-off at or above the Nyquist frequency, which would
+    stop Pose2Sim's filtering stage."""
+    return min(parse_filter_cutoff(cutoff), max_filter_cutoff(frame_rate))
 
 
 def _load(path: Path) -> dict:
@@ -97,6 +123,11 @@ def generate_config(project, out_file: Path | None = None) -> Path:
     # which stalled a headless run for ~40 min. Force it off.
     filt = data.setdefault("filtering", {})
     filt["display_figures"] = False
+    # Zero-lag Butterworth low-pass (the template's filter and order) with the project's
+    # cut-off: 6 Hz (Pose2Sim's default) removes real motion of fast movements (throwing).
+    filt["type"] = "butterworth"
+    filt.setdefault("butterworth", {})["cut_off_frequency"] = effective_filter_cutoff(
+        getattr(cfg, "filter_cutoff_hz", DEFAULT_FILTER_CUTOFF_HZ), cfg.frame_rate)
 
     # ---- [calibration] ----
     # We calibrate ourselves and hand Pose2Sim a ready Calib.toml, so default to

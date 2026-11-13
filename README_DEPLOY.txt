@@ -40,6 +40,22 @@ NOTES
   * If Windows SmartScreen warns about run.bat, choose "More info -> Run
     anyway" (it is a plain batch file, not signed).
 
+FILTER CUT-OFF (1. Project)
+---------------------------
+"Filter cut-off" (under "Frame rate" on 1. Project) is the cut-off of the
+low-pass Butterworth filter (4th order, zero-lag) that the filtering stage
+applies to the 3D trajectories before inverse kinematics. 6 Hz is Pose2Sim's
+default and suits walking and slow movements (3-6 Hz); running needs about
+6-15 Hz, throwing and other very fast movements 12-20 Hz (6 Hz removes real
+motion of a pitch). Whole Hz only, and always below half the frame rate (at
+60 fps at most 29 Hz). Use the same value for all trials you compare. The
+value is kept in project.toml and written into Config.toml on Save settings
+(edit it here, not in Config.toml: Config.toml is regenerated). A new value
+applies from the filtering stage on: Save settings, then on 4. Run re-run
+from "Filter 3D" (tick "Filter 3D" and the stages after it; the 2D and
+triangulated 3D results are reused). The Run log shows the value used, e.g.
+"[filtering] Butterworth low-pass 13 Hz (Config.toml)".
+
 WII BALANCE BOARD (OPTIONAL)
 ----------------------------
 PoseAssess can record a Nintendo Wii Balance Board together with the

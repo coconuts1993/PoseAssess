@@ -23,8 +23,13 @@ from PySide6.QtWidgets import (
 )
 
 from poseassess.core import openpose_setup as ops
-from poseassess.core.config_gen import generate_config
-from poseassess.core.project import CheckerboardConfig, Project, ProjectConfig
+from poseassess.core.config_gen import generate_config, max_filter_cutoff, parse_filter_cutoff
+from poseassess.core.project import (
+    DEFAULT_FILTER_CUTOFF_HZ,
+    CheckerboardConfig,
+    Project,
+    ProjectConfig,
+)
 
 from ..widgets.openpose_dialog import (
     MUTED,
@@ -46,6 +51,14 @@ _MISSING_STYLE = (f'QLineEdit[{MISSING_PROP}="true"] {{ border: 2px solid {WARN}
                   "border-radius: 3px; }")
 AUTO_PLACEHOLDER = "auto-detect (C:\\openpose, next to PoseAssess, ...)"
 MISSING_PLACEHOLDER = "e.g. C:\\openpose (none found automatically)"
+FILTER_CUTOFF_TIP = (
+    "Cut-off of the low-pass Butterworth filter (4th order, zero-lag) that Pose2Sim's "
+    "filtering stage applies to the 3D trajectories before inverse kinematics. "
+    "Usual values: 3-6 Hz walking and slow movements, 6-15 Hz running, 12-20 Hz throwing "
+    "and other very fast movements (6 Hz is Pose2Sim's default). Use the same value for "
+    "all trials you compare. It stays below half the frame rate, so its maximum follows "
+    "Frame rate. A new value applies from the filtering stage on: Save settings, then "
+    "re-run from 'Filter 3D' on 4. Run (Filter 3D and the stages after it).")
 
 
 class _CheckBridge(QObject):
@@ -135,6 +148,17 @@ class ProjectPage(BasePage):
         self.name_edit = QLineEdit()
         self.cameras_spin = QSpinBox(); self.cameras_spin.setRange(1, 32); self.cameras_spin.setValue(6)
         self.fps_spin = QSpinBox(); self.fps_spin.setRange(1, 1000); self.fps_spin.setValue(60)
+        self.cutoff_spin = QSpinBox()
+        self.cutoff_spin.setObjectName("filterCutoff")
+        self.cutoff_spin.setSuffix(" Hz")
+        self.cutoff_spin.setToolTip(FILTER_CUTOFF_TIP)
+        # the value asked for (typed or loaded); shown clamped to the frame rate's maximum, so
+        # passing through a low frame rate while typing one does not lose it
+        self._cutoff_wanted = DEFAULT_FILTER_CUTOFF_HZ
+        self._clamping_cutoff = False
+        self.cutoff_spin.valueChanged.connect(self._on_cutoff_changed)
+        self.fps_spin.valueChanged.connect(self._update_cutoff_max)
+        self._update_cutoff_max()
         self.backend_combo = BackendCombo()
         from poseassess.core.pose_backends import POSE_BACKENDS
         for name, spec in POSE_BACKENDS.items():
@@ -149,6 +173,7 @@ class ProjectPage(BasePage):
         form.addRow("Session name", self.name_edit)
         form.addRow("Cameras", self.cameras_spin)
         form.addRow("Frame rate", self.fps_spin)
+        form.addRow("Filter cut-off", self.cutoff_spin)
         form.addRow("2D backend", self.backend_combo)
         self.openpose_row = self._build_openpose_row()
         form.addRow("OpenPose folder", self.openpose_row)
@@ -225,6 +250,27 @@ class ProjectPage(BasePage):
         self.openpose_status.setSizePolicy(sp)
         v.addWidget(self.openpose_status)
         return row
+
+    # ---- filter cut-off ----
+    def _on_cutoff_changed(self, value: int) -> None:
+        if not self._clamping_cutoff:
+            self._cutoff_wanted = value
+
+    def _update_cutoff_max(self, *_) -> None:
+        """Keep the cut-off below the Nyquist frequency of the frame rate entered."""
+        top = max_filter_cutoff(self.fps_spin.value())
+        self._clamping_cutoff = True
+        try:
+            self.cutoff_spin.setRange(1, top)
+            self.cutoff_spin.setValue(min(self._cutoff_wanted, top))
+        finally:
+            self._clamping_cutoff = False
+
+    def _set_cutoff(self, value) -> None:
+        """Show `value` (from project.toml) like Config.toml gets it: whole Hz, below the
+        Nyquist frequency of the frame rate shown."""
+        self._cutoff_wanted = parse_filter_cutoff(value)
+        self._update_cutoff_max()
 
     # ---- OpenPose network resolution ----
     def _openpose_res_setting(self) -> str:
@@ -446,6 +492,7 @@ class ProjectPage(BasePage):
             name=self.name_edit.text().strip() or Path(root).name,
             num_cameras=self.cameras_spin.value(),
             frame_rate=self.fps_spin.value(),
+            filter_cutoff_hz=self.cutoff_spin.value(),
             pose2d_backend=self.backend_combo.currentData(),
             openpose_dir=self._openpose_setting(),
             openpose_net_resolution=self._openpose_res_setting(),
@@ -494,6 +541,7 @@ class ProjectPage(BasePage):
         c.name = self.name_edit.text().strip() or c.name
         c.num_cameras = self.cameras_spin.value()
         c.frame_rate = self.fps_spin.value()
+        c.filter_cutoff_hz = self.cutoff_spin.value()
         c.pose2d_backend = self.backend_combo.currentData()
         c.openpose_dir = self._openpose_setting()
         c.openpose_net_resolution = self._openpose_res_setting()
@@ -517,6 +565,7 @@ class ProjectPage(BasePage):
         self.name_edit.setText(c.name)
         self.cameras_spin.setValue(c.num_cameras)
         self.fps_spin.setValue(c.frame_rate)
+        self._set_cutoff(getattr(c, "filter_cutoff_hz", DEFAULT_FILTER_CUTOFF_HZ))
         self.openpose_edit.setText(c.openpose_dir or "")
         self._set_openpose_res(getattr(c, "openpose_net_resolution", ""))
         i = self.backend_combo.findData(c.pose2d_backend)

@@ -31,6 +31,9 @@ except ImportError:  # pragma: no cover - writing needs the dep, reading does no
 PROJECT_FILE = "project.toml"
 CONFIG_FILE = "Config.toml"  # Pose2Sim config, kept in the workspace root
 
+#: Pose2Sim's default Butterworth low-pass cut-off (its Demo_SinglePerson Config.toml), Hz.
+DEFAULT_FILTER_CUTOFF_HZ = 6
+
 
 # --------------------------------------------------------------------------- #
 # Configuration dataclasses
@@ -76,6 +79,10 @@ class ProjectConfig:
     openpose_net_resolution: str = ""  # OpenPose --net_resolution, "" = default (-1x368)
     opensim_cmd: str = ""          # path to opensim-cmd.exe
     osim_model: str = ""           # path to the .osim model file
+
+    # Pose2Sim filtering stage: cut-off of the Butterworth low-pass on the 3D trajectories
+    # (Hz; written to Config.toml, kept below half the frame rate there).
+    filter_cutoff_hz: int = DEFAULT_FILTER_CUTOFF_HZ
 
     def to_dict(self) -> dict:
         d = asdict(self)

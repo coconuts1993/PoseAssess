@@ -16,10 +16,16 @@ Each stage can be run individually (GUI "run this step" buttons) or via
 from __future__ import annotations
 
 import os
+import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:  # pragma: no cover
+    import tomli as tomllib
 
 ProgressFn = Callable[[str], None]
 
@@ -195,7 +201,26 @@ class Pipeline:
         res.ok = any(self.project.pose3d_dir.glob("*.trc"))
         return res
 
+    def _filter_note(self) -> Optional[str]:
+        """What Pose2Sim's filtering stage will do, from Config.toml, for the log (None
+        when Config.toml cannot be read: Pose2Sim then reports the problem itself)."""
+        try:
+            with open(self.project.config_file, "rb") as f:
+                filt = tomllib.load(f).get("filtering", {})
+            if not filt.get("filter", True):
+                return "[filtering] no low-pass filter (filter = false in Config.toml)"
+            kind = filt.get("type", "butterworth")
+            if kind != "butterworth":
+                return f"[filtering] filter type {kind!r} (Config.toml)"
+            cutoff = int(filt.get("butterworth", {}).get("cut_off_frequency", 6))
+        except (OSError, ValueError, TypeError, AttributeError):
+            return None
+        return f"[filtering] Butterworth low-pass {cutoff} Hz (Config.toml)"
+
     def filtering(self) -> StageResult:
+        note = self._filter_note()
+        if note:
+            self._log(note)
         return self._pose2sim_stage("filtering")
 
     def markerAugmentation(self) -> StageResult:
